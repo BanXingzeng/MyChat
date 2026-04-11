@@ -130,6 +130,19 @@ myChat/
 4. **可扩展架构**: 模块化设计，便于功能扩展和维护
 5. **代码质量**: 规范的代码结构，合理的类设计，完善的错误处理
 
+## 项目效果截图
+
+![image-20260411180659215](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411180659215.png)
+![image-20260411181440493](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181440493.png)
+
+![image-20260411181504471](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181504471.png)
+
+![image-20260411181601364](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181601364.png)
+
+![image-20260411181750089](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181750089.png)
+
+![image-20260411181758592](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181758592.png)
+
 ## 开发难点与解决方案
 
 1. **TCP粘包问题**: 通过自定义消息头（长度+类型+数据）解决粘包问题
