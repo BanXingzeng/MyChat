@@ -132,16 +132,17 @@ myChat/
 
 ## 项目效果截图
 
-![image-20260411180659215](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411180659215.png)
-![image-20260411181440493](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181440493.png)
+![1](.\img\1.png)
 
-![image-20260411181504471](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181504471.png)
+![1](.\img\2.png)
 
-![image-20260411181601364](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181601364.png)
+![1](.\img\3.png)
 
-![image-20260411181750089](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181750089.png)
+![1](.\img\4.png)
 
-![image-20260411181758592](C:\Users\Lenovo\AppData\Roaming\Typora\typora-user-images\image-20260411181758592.png)
+![1](.\img\5.png)
+
+![1](.\img\6.png)
 
 ## 开发难点与解决方案
 
