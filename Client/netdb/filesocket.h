@@ -8,6 +8,8 @@
 #include <QDataStream>
 #include <QJsonObject>
 
+#include "comapi/cryptoutil.h"
+
 class FileSocket : public QObject
 {
     Q_OBJECT
@@ -31,6 +33,14 @@ public:
     void stopSendFile();
     // 请求下载文件（向服务器发送下载指令）
     void requestFile(const QString &remoteFileName);
+
+    // ===== 端到端加密（文件内容）=====
+    // 发送端：一次性会话密钥 + 各接收者公钥包裹后的元数据（JSON 字节）
+    void setEncryptSession(const QByteArray &key, const QByteArray &iv, const QByteArray &metaJson);
+    // 接收端：本机身份，用于从文件头解出属于自己的那份会话密钥
+    void setDecryptIdentity(int userId, const QString &privPem);
+    // 本端是否已具备加解密条件
+    bool hasEncryptSession() const;
 
 signals:
     // 文件服务器连接成功
@@ -57,6 +67,8 @@ private slots:
 private:
     // 重置发送状态（清空计数、缓冲区等）
     void resetSendState();
+    // 用文件头里的 meta 初始化接收端解密流
+    bool initRecvCrypto(const QByteArray &metaBytes);
 
 private:
     QTcpSocket *m_tcpSocket = nullptr;      // TCP Socket
@@ -77,6 +89,14 @@ private:
     qint64 m_recvTotalBytes = 0;            // 接收文件总字节数
     qint64 m_recvProcessedBytes = 0;        // 已接收/处理字节数
     QByteArray m_recvBuffer;                // 接收缓冲区
+
+    // 端到端加密（文件内容）
+    QByteArray m_sendKey;                   // 发送会话密钥（32 字节）
+    QByteArray m_sendIv;                    // 发送会话 IV（16 字节）
+    QByteArray m_sendMeta;                  // 发送端加密头（JSON）
+    int        m_decryptUid = 0;            // 接收端本机用户 ID
+    QString    m_decryptPriv;               // 接收端本机私钥 PEM
+    CryptoStream m_stream;                  // 收发共用的 AES-256-CTR 流
 
     // 状态标记
     bool m_isSending = false;               // 是否正在发送文件

@@ -29,7 +29,8 @@ public:
     static quint16     m_nGroupPort;        // 群组聊天窗口
 
     static QString m_strUserName;       // 用户名
-    static QString m_strPassword;       // 用户密码
+    static QString m_strPassword;       // 用户密码（内存里始终保留，重连要用）
+    static bool    m_bRememberPwd;      // 记住密码（决定口令是否落盘）
     static QString m_strHeadFile;       // 头像文件
 
 
@@ -53,9 +54,14 @@ public:
     static void CheckSound();
 
     static void SaveConfig();
+    /// 保存/清除登录口令：m_bRememberPwd 为假时直接删掉这一项。
+    /// 口令用 Windows DPAPI 加密后再写盘，不再以明文躺在 config.ini 里。
+    static void SavePassword(const QString &password);
 
     static void setDefaultHead();
 
+    /// 头像文件名（或历史遗留的完整路径）转成本地完整路径，空值回退 default.png
+    static QString HeadFullPath(const QString &head);
 };
 
 #endif // MYAPP_H

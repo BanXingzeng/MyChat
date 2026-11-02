@@ -239,3 +239,112 @@ QLineEdit {
 QLineEdit:focus {
     border: 1px solid #1583DD;
 }
+
+
+/* ===== 服务器管理页补充样式 ===== */
+
+QLabel {
+    color: #333333;
+}
+
+QGroupBox {
+    background-color: #FFFFFF;
+    border: 1px solid #D5DCE5;
+    border-radius: 4px;
+    margin-top: 14px;
+    padding: 8px;
+    font: bold 13px "微软雅黑";
+    color: #387ECC;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 6px;
+    color: #387ECC;
+}
+
+QTableView {
+    background-color: #FFFFFF;
+    alternate-background-color: #F6F9FD;
+    border: 1px solid #D5DCE5;
+    gridline-color: #EAEFF5;
+    selection-background-color: #DCEBFF;
+    selection-color: #000000;
+    font: 12px "微软雅黑";
+}
+
+QTableView::item {
+    padding: 3px 4px;
+}
+
+QHeaderView::section {
+    background-color: #EEF3F9;
+    color: #33506E;
+    border: none;
+    border-right: 1px solid #DDE4EC;
+    border-bottom: 1px solid #DDE4EC;
+    padding: 6px 4px;
+    font: bold 12px "微软雅黑";
+}
+
+QTextBrowser {
+    background-color: #FFFFFF;
+    border: 1px solid #D5DCE5;
+    selection-background-color: #DCEBFF;
+    selection-color: #000000;
+    font: 12px "微软雅黑";
+}
+
+QListWidget {
+    background-color: #FFFFFF;
+    border: 1px solid #D5DCE5;
+    font: 12px "微软雅黑";
+}
+
+QListWidget::item {
+    padding: 6px 8px;
+    border-bottom: 1px dashed #EDF1F6;
+}
+
+QListWidget::item:selected {
+    background-color: #DCEBFF;
+    color: #000000;
+}
+
+QSpinBox {
+    border: 1px solid #D1D1D1;
+    background-color: #FFFFFF;
+    min-height: 24px;
+    padding-left: 4px;
+    color: #333333;
+}
+
+QSpinBox:focus {
+    border: 1px solid #1583DD;
+}
+
+QPushButton#btnUserSearch {
+    min-width: 80px;
+    background: #387ECC;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 3px;
+}
+
+QPushButton#btnUserSearch:hover {
+    background: #2F6DBA;
+}
+
+QToolButton {
+    border: 1px solid #D1D1D1;
+    background: #FFFFFF;
+    color: #333333;
+    min-width: 28px;
+    min-height: 24px;
+}
+
+QToolButton:hover {
+    background: #EEF3F9;
+}

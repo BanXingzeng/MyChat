@@ -33,6 +33,9 @@ public:
     int     id;             //QQ号，作为标识
     int     status;
 
+    int     unread;         // 未读消息条数（0 表示不显示角标）
+    bool    isGroup;        // 会话列表里标记该会话是群组还是好友
+
     //
     QQCellType_e type;
 

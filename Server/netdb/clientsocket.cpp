@@ -1,13 +1,36 @@
 #include "clientsocket.h"
 #include "databasemag.h"
-#include "databasemag.h"
+#include "myserver.h"
 #include "comapi/unit.h"
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QImage>
+#include <QDir>
+#include "comapi/myapp.h"
+
+// 把客户端传来的图片统一裁剪成 96x96 的正方形头像
+static QImage NormalizedHead(const QByteArray &raw)
+{
+    QImage img;
+    if (!img.loadFromData(raw) || img.isNull()) {
+        return QImage();
+    }
+    const int side = qMin(img.width(), img.height());
+    if (side <= 0) {
+        return QImage();
+    }
+    QImage square = img.copy((img.width() - side) / 2, (img.height() - side) / 2, side, side);
+    return square.scaled(96, 96, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+}
 
 ClientSocket::ClientSocket(QObject *parent, QTcpSocket *tcpSocket)
 {
     m_nId = -1;
+    m_lastActive = QDateTime::currentDateTime();
 
     m_tcpSocket = tcpSocket; // 优先使用传入的 Socket（服务器端场景）
     if (!m_tcpSocket) { // 只有传入为空时，才新建（客户端主动连接场景）
@@ -28,6 +51,26 @@ ClientSocket::~ClientSocket()
 int ClientSocket::GetUserId()
 {
     return  m_nId;
+}
+
+/**
+ * @brief 最近一次收到该连接数据的时刻，用于心跳超时判定
+ */
+QDateTime ClientSocket::lastActiveTime() const
+{
+    return m_lastActive;
+}
+
+/**
+ * @brief 主动关闭连接（顶号时用），会触发 disconnected -> signalDisConnected
+ */
+void ClientSocket::kick()
+{
+    if (m_tcpSocket) {
+        m_tcpSocket->disconnectFromHost();
+        if (m_tcpSocket->state() != QAbstractSocket::UnconnectedState)
+            m_tcpSocket->abort();
+    }
 }
 
 void ClientSocket::Close()
@@ -113,7 +156,398 @@ void ClientSocket::sendMsgType(const quint8 &nType, const QJsonValue &dataVal)
         ParseSendGroupMsg(dataVal);
         break;
     }
+    case RecallMsg:
+    {
+        ParseRecallMsg(dataVal);
+        break;
     }
+    case UpdateHeadPic:
+    {
+        ParseUpdateUserHead(dataVal);
+        break;
+    }
+    case GetUserHead:
+    {
+        ParseGetUserHead(dataVal);
+        break;
+    }
+    case QuitGroup:
+    {
+        ParseQuitGroup(dataVal);
+        break;
+    }
+    case DissolveGroup:
+    {
+        ParseDissolveGroup(dataVal);
+        break;
+    }
+    case GetGroupMembers:
+    {
+        ParseGetGroupMembers(dataVal);
+        break;
+    }
+    case KickGroupMember:
+    {
+        ParseKickGroupMember(dataVal);
+        break;
+    }
+    case TransferGroupOwner:
+    {
+        ParseTransferGroupOwner(dataVal);
+        break;
+    }
+    case ChangePasswd:
+    {
+        ParseChangePasswd(dataVal);
+        break;
+    }
+    case UploadKeys:
+    {
+        ParseUploadKeys(dataVal);
+        break;
+    }
+    case GetPubKey:
+    {
+        ParseGetPubKey(dataVal);
+        break;
+    }
+    case HeartBeat:
+    {
+        // 只要收到心跳就认为这条连接还活着，回一个应答让客户端知道链路正常
+        m_lastActive = QDateTime::currentDateTime();
+        QJsonObject ack;
+        ack.insert("t", QDateTime::currentMSecsSinceEpoch());
+        SltSendMessage(HeartBeatAck, QJsonValue(ack));
+        break;
+    }
+    }
+}
+
+/**
+ * @brief ClientSocket::ParseGetGroupMembers
+ * 客户端拉取群成员列表：只有群成员才能看，返回昵称/头像/角色/在线状态
+ */
+void ClientSocket::ParseGetGroupMembers(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) return;
+
+    const QJsonObject jsonObj = dataVal.toObject();
+    const int groupId = jsonObj.value("groupId").toInt();
+    if (groupId <= 0) {
+        qDebug() << "[群成员] 群号无效";
+        return;
+    }
+
+    const QJsonValue members = DataBaseMag::getInstance()->getGroupMemberDetail(groupId);
+
+    // 非成员不给看：避免拿到别人的群成员名单
+    bool isMember = false;
+    const QJsonArray arr = members.toArray();
+    for (const QJsonValue &item : arr) {
+        if (item.toObject().value("userId").toInt() == m_nId) {
+            isMember = true;
+            break;
+        }
+    }
+    if (!isMember) {
+        QJsonObject errObj;
+        errObj.insert("groupId", groupId);
+        errObj.insert("msg", QString("你不在该群聊中，无法查看成员"));
+        SltSendMessage(GroupOperateFailed, QJsonValue(errObj));
+        return;
+    }
+
+    QJsonObject resObj;
+    resObj.insert("groupId", groupId);
+    resObj.insert("ownerId", DataBaseMag::getInstance()->getGroupOwner(groupId));
+    resObj.insert("members", members);
+    SltSendMessage(GroupMembers, QJsonValue(resObj));
+
+    qDebug() << "[群成员] 已下发群" << groupId << "的成员列表，共" << arr.size() << "人";
+}
+
+/**
+ * @brief ClientSocket::broadcastGroupMembersChanged
+ * 成员变动后通知群里其它人刷新列表（组播会跳过操作者自己，离线成员进离线队列）
+ */
+void ClientSocket::broadcastGroupMembersChanged(int groupId, int ownerId)
+{
+    QJsonObject noticeObj;
+    noticeObj.insert("groupId", groupId);
+    noticeObj.insert("ownerId", ownerId);
+    noticeObj.insert("operatorId", m_nId);
+    emit signalGroupMsgToClient(m_nId, groupId, GroupMemberChanged, QJsonValue(noticeObj));
+}
+
+/**
+ * @brief ClientSocket::ParseKickGroupMember
+ * 群主把某人移出群聊：被踢的人收到 GroupKicked，其余成员收到成员变动通知
+ */
+void ClientSocket::ParseKickGroupMember(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) return;
+
+    const QJsonObject jsonObj = dataVal.toObject();
+    const int groupId  = jsonObj.value("groupId").toInt();
+    const int targetId = jsonObj.value("userId").toInt();
+
+    QJsonObject resObj;
+    resObj.insert("groupId", groupId);
+    resObj.insert("userId", targetId);
+
+    auto fail = [this, &resObj](const QString &msg) {
+        resObj.insert("msg", msg);
+        SltSendMessage(GroupOperateFailed, QJsonValue(resObj));
+        qDebug() << "[群成员] 移出失败：" << msg;
+    };
+
+    if (groupId <= 0 || targetId <= 0) {
+        fail(QString("参数有误"));
+        return;
+    }
+    if (targetId == m_nId) {
+        fail(QString("不能把自己移出群聊，请使用退出群组"));
+        return;
+    }
+    if (!DataBaseMag::getInstance()->isGroupOwner(groupId, m_nId)) {
+        fail(QString("只有群主才能移出成员"));
+        return;
+    }
+    if (DataBaseMag::getInstance()->isGroupOwner(groupId, targetId)) {
+        fail(QString("不能移出群主"));
+        return;
+    }
+
+    const QString groupName = DataBaseMag::getInstance()->getGroupName(groupId);
+    if (!DataBaseMag::getInstance()->removeGroupMember(groupId, targetId)) {
+        fail(QString("该成员不在群里或已被移出"));
+        return;
+    }
+
+    // 通知被踢的人：在线立刻收到，离线则进队列，下次登录也会看到
+    QJsonObject kickObj;
+    kickObj.insert("groupId", groupId);
+    kickObj.insert("name", groupName);
+    kickObj.insert("operatorId", m_nId);
+    emit signalPrivateMsgToClient(m_nId, targetId, GroupKicked, QJsonValue(kickObj));
+
+    // 同步服务端的群成员缓存，之后的消息不再发给这个人
+    emit signalRemoveGroupMembers(groupId, targetId);
+
+    broadcastGroupMembersChanged(groupId, DataBaseMag::getInstance()->getGroupOwner(groupId));
+
+    qInfo() << "[群成员] 用户" << m_nId << "把用户" << targetId
+            << "移出了群" << groupId << groupName;
+
+    resObj.insert("msg", "ok");
+    SltSendMessage(GroupMemberChanged, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseTransferGroupOwner
+ * 群主转让：原群主降为普通成员，目标成员升为群主，双方与群内其它人都收到通知
+ */
+void ClientSocket::ParseTransferGroupOwner(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) return;
+
+    const QJsonObject jsonObj = dataVal.toObject();
+    const int groupId  = jsonObj.value("groupId").toInt();
+    const int targetId = jsonObj.value("userId").toInt();
+
+    QJsonObject resObj;
+    resObj.insert("groupId", groupId);
+    resObj.insert("userId", targetId);
+
+    auto fail = [this, &resObj](const QString &msg) {
+        resObj.insert("msg", msg);
+        SltSendMessage(GroupOperateFailed, QJsonValue(resObj));
+        qDebug() << "[群成员] 转让失败：" << msg;
+    };
+
+    if (groupId <= 0 || targetId <= 0) {
+        fail(QString("参数有误"));
+        return;
+    }
+    if (targetId == m_nId) {
+        fail(QString("你已经是群主了"));
+        return;
+    }
+    if (!DataBaseMag::getInstance()->isGroupOwner(groupId, m_nId)) {
+        fail(QString("只有群主才能转让群主"));
+        return;
+    }
+    if (!DataBaseMag::getInstance()->getGroupMember(groupId).isArray()) {
+        fail(QString("群成员数据异常"));
+        return;
+    }
+
+    // 目标必须还在群里
+    bool targetInGroup = false;
+    const QJsonArray arr = DataBaseMag::getInstance()->getGroupMember(groupId).toArray();
+    for (const QJsonValue &item : arr) {
+        if (item.toObject().value("userId").toInt() == targetId) {
+            targetInGroup = true;
+            break;
+        }
+    }
+    if (!targetInGroup) {
+        fail(QString("该用户已不在群里"));
+        return;
+    }
+
+    DataBaseMag::getInstance()->setGroupMemberIdentity(groupId, targetId, Owner);
+    DataBaseMag::getInstance()->setGroupMemberIdentity(groupId, m_nId, Member);
+    DataBaseMag::getInstance()->setGroupCreator(groupId, targetId);
+
+    // 被转让的人单独收一条，确保他即使不在群里开会话也能感知
+    QJsonObject noticeObj;
+    noticeObj.insert("groupId", groupId);
+    noticeObj.insert("name", DataBaseMag::getInstance()->getGroupName(groupId));
+    noticeObj.insert("ownerId", targetId);
+    noticeObj.insert("operatorId", m_nId);
+    emit signalPrivateMsgToClient(m_nId, targetId, GroupMemberChanged, QJsonValue(noticeObj));
+
+    broadcastGroupMembersChanged(groupId, targetId);
+
+    qInfo() << "[群成员] 群" << groupId << "的群主由" << m_nId << "转让给" << targetId;
+
+    resObj.insert("ownerId", targetId);
+    resObj.insert("msg", "ok");
+    SltSendMessage(GroupMemberChanged, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseChangePasswd
+ * 修改密码：校验原密码 -> 更新 -> 回执
+ */
+void ClientSocket::ParseChangePasswd(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) {
+        qDebug() << "修改密码数据有误";
+        return;
+    }
+
+    const QJsonObject jsonObj = dataVal.toObject();
+    const QString oldPwd = jsonObj.value("old").toString();
+    const QString newPwd = jsonObj.value("new").toString();
+
+    QJsonObject resObj;
+    if (m_nId <= 0) {
+        resObj.insert("msg", QString("尚未登录，无法修改密码"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+    if (oldPwd.isEmpty() || newPwd.isEmpty()) {
+        resObj.insert("msg", QString("原密码和新密码都不能为空"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+    if (newPwd.length() < 6) {
+        resObj.insert("msg", QString("新密码长度不能少于 6 位"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+
+    const QString name = DataBaseMag::getInstance()->getUserInfoById(m_nId).value("name").toString();
+    if (name.isEmpty()) {
+        resObj.insert("msg", QString("账号不存在"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+    if (!DataBaseMag::getInstance()->checkPassword(name, oldPwd)) {
+        resObj.insert("msg", QString("原密码不正确"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+    if (oldPwd == newPwd) {
+        resObj.insert("msg", QString("新密码不能与原密码相同"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+    if (!DataBaseMag::getInstance()->updatePassword(name, newPwd)) {
+        resObj.insert("msg", QString("密码更新失败，请稍后重试"));
+        SltSendMessage(ChangePasswdFailed, QJsonValue(resObj));
+        return;
+    }
+
+    qDebug() << "用户" << name << "(" << m_nId << ") 修改密码成功";
+    SltSendMessage(ChangePasswdOk, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseUploadKeys
+ * 客户端上传自己的 RSA 公钥（供他人加密时使用）。
+ * 公钥本身就是公开信息，服务器只把它登记成通讯录；私钥永远不出客户端。
+ */
+void ClientSocket::ParseUploadKeys(const QJsonValue &dataVal)
+{
+    QJsonObject resObj;
+    if (!dataVal.isObject()) {
+        resObj.insert("msg", QString("密钥数据格式错误"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+    if (m_nId <= 0) {
+        resObj.insert("msg", QString("尚未登录，无法上传密钥"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    const QJsonObject jsonObj = dataVal.toObject();
+    const QString pubKey = jsonObj.value("pub").toString();
+
+    if (pubKey.isEmpty() || !pubKey.contains("BEGIN PUBLIC KEY")) {
+        resObj.insert("msg", QString("公钥格式不正确"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    if (!DataBaseMag::getInstance()->updateUserKeys(m_nId, pubKey)) {
+        resObj.insert("msg", QString("密钥保存失败"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    qInfo() << "[加密] 用户" << m_nId << "上传公钥（服务器不保存任何私钥）";
+    resObj.insert("msg", QString("ok"));
+    resObj.insert("escrow", false);       // 兼容老客户端字段；本版本不存在密钥托管
+
+    SltSendMessage(UploadKeysOk, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseGetPubKey
+ * 请求用户公钥。data: {"ids":[1,2,3]} 或 {"id":5}；ids 为空表示"我的好友+同群成员"
+ */
+void ClientSocket::ParseGetPubKey(const QJsonValue &dataVal)
+{
+    DataBaseMag *db = DataBaseMag::getInstance();
+    QList<int> ids;
+
+    if (dataVal.isObject()) {
+        const QJsonObject obj = dataVal.toObject();
+        if (obj.contains("ids")) {
+            const QJsonArray arr = obj.value("ids").toArray();
+            for (int i = 0; i < arr.size(); ++i) ids.append(arr.at(i).toInt());
+        } else if (obj.contains("id")) {
+            ids.append(obj.value("id").toInt());
+        }
+    }
+
+    QJsonObject keys;
+    int missing = 0;
+    foreach (int uid, ids) {
+        if (uid <= 0) continue;
+        const QString pem = db->getUserPubKey(uid);
+        if (pem.isEmpty()) { ++missing; continue; }
+        keys.insert(QString::number(uid), pem);
+    }
+
+    QJsonObject resObj;
+    resObj.insert("keys", keys);
+    resObj.insert("missing", missing);
+    SltSendMessage(PubKeyData, QJsonValue(resObj));
 }
 
 void ClientSocket::SltSendMessage(const quint8 &type, const QJsonValue &jsonVal)
@@ -130,7 +564,11 @@ void ClientSocket::SltSendMessage(const quint8 &type, const QJsonValue &jsonVal)
     QJsonDocument document;
     document.setObject(jsonObj);
     QByteArray jsonData = document.toJson(QJsonDocument::Compact);
-    qDebug() << "服务器发送消息：" << jsonData;
+    // 图片消息是大包，日志只留摘要
+    if (jsonData.size() <= 512)
+        qDebug() << "服务器发送消息：" << jsonData;
+    else
+        qDebug() << "服务器发送消息：大包" << jsonData.size() << "字节 type" << type;
 
     //防止粘包
     quint32 dataLen = static_cast<quint32>(jsonData.size());
@@ -153,15 +591,21 @@ void ClientSocket::SltConnected()
 void ClientSocket::SltDisconnected()
 {
     qDebug() << "服务器端socket检测到有用户下线";
-    DataBaseMag::getInstance()->UpdateUserStatus(m_nId, OffLine);
+    // 这里不直接改数据库状态：同一账号可能已经重新登录（新连接已在 hash 中），
+    // 旧连接晚一步断开时如果把 status 置成 OffLine，会把在线的人标成离线。
+    // 具体是否真的下线由 TcpMsgServer 根据连接表判定。
     Q_EMIT signalDisConnected(this);
 }
 
 void ClientSocket::SltReadyRead()
 {
+    m_lastActive = QDateTime::currentDateTime();
     QByteArray newData = m_tcpSocket->readAll();
     m_recvBuffer.append(newData);
-    qDebug() << "服务器收到消息：" << newData;
+    if (newData.size() <= 512)
+        qDebug() << "服务器收到消息：" << newData;
+    else
+        qDebug() << "服务器收到消息：大包" << newData.size() << "字节";
     while (true) {
         // 先检查是否够4字节长度头
         if (m_recvBuffer.size() < 4) {
@@ -185,7 +629,13 @@ void ClientSocket::SltReadyRead()
             QJsonObject jsonObj = doc.object();
             quint8 nType = static_cast<quint8>(jsonObj["type"].toInt());            QString from = jsonObj["from"].toString();
             QJsonValue dataVal = jsonObj["data"];
-            m_nId = jsonObj["from"].toInt();
+
+            // 登录成功后身份以 socket 绑定的 id 为准，不再用包里的 from 覆盖：
+            // 否则客户端只要把 from 改成别人的 id，就能冒充他人发消息 / 操作群。
+            // 未登录（m_nId <= 0）时仍允许用它兜底，方便登录前的一些查询。
+            if (m_nId <= 0) {
+                m_nId = jsonObj["from"].toInt();
+            }
 
             sendMsgType(nType,dataVal);
         }
@@ -205,13 +655,34 @@ void ClientSocket::ParseLogin(const QJsonValue &dataVal)
 
         m_nId = jsonObj.value("id").toInt();
 
+        QString msg = jsonObj.value("msg").toString();
+
+        // 数据库记着"在线"，但连接表里根本没有这个人 —— 说明上次是异常退出
+        // （进程被杀/断网），状态没被回收。这种脏数据不能把用户永远挡在门外。
+        if (msg == "OnLine") {
+            const int realId = jsonObj.value("realId").toInt();
+            TcpMsgServer *srv = TcpMsgServer::instance();
+            const bool actuallyOnline = srv && srv->isUserOnline(realId);
+            if (realId > 0 && !actuallyOnline) {
+                qInfo() << "[登录] 用户" << realId << "数据库状态为在线但无实际连接，按离线放行";
+                DataBaseMag::getInstance()->UpdateUserStatus(realId, OnLine);
+                jsonObj.insert("id", realId);
+                jsonObj.insert("msg", "ok");
+                m_nId = realId;
+                msg = "ok";
+            }
+        }
+
         if (m_nId > 0) emit signalConnected();
 
-        QString msg = jsonObj.value("msg").toString();
         if(msg == "ok"){  //不在线
             SltSendMessage(LoginSuccess, jsonObj);
+
+            // 服务器不下发任何密钥材料：端到端加密要求服务器零知识，
+            // 它只保管用户公钥，永远不持有能解开正文的私钥。
             emit signalLoginSuccess(this,QString::number(m_nId));
             qDebug() << "登陆成功" << dataVal;
+
             SltSendMessage(GetMyFriends,DataBaseMag::getInstance()->getMyFriends(m_nId));
             SltSendMessage(GetMyGroups, DataBaseMag::getInstance()->getMyGroup(m_nId));
             return;
@@ -234,9 +705,128 @@ void ClientSocket::ParseLogout(const QJsonValue &dataVal)
 
 }
 
+/**
+ * @brief ClientSocket::ParseUpdateUserHead
+ * 客户端上传头像：保存到服务器 UserHeads 目录 -> 更新数据库 -> 回执 -> 广播通知其它在线用户
+ */
 void ClientSocket::ParseUpdateUserHead(const QJsonValue &dataVal)
 {
+    if (!dataVal.isObject()) {
+        qDebug() << "[头像] 上传数据格式有误";
+        return;
+    }
+    QJsonObject jsonObj = dataVal.toObject();
 
+    QJsonObject resObj;
+    resObj.insert("id", m_nId);
+
+    // 只能改自己的头像
+    const int userId = jsonObj.value("id").toInt(m_nId);
+    if (m_nId <= 0 || userId != m_nId) {
+        resObj.insert("msg", QString("身份校验失败，无法修改头像"));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        qWarning() << "[头像] 身份校验失败 client =" << m_nId << " 请求id =" << userId;
+        return;
+    }
+
+    // 文件名只取 basename，避免目录穿越
+    QString head = QFileInfo(jsonObj.value("head").toString()).fileName();
+    if (head.isEmpty() || !head.endsWith(".png", Qt::CaseInsensitive)) {
+        head = QString("head_%1_%2.png")
+                   .arg(userId)
+                   .arg(QDateTime::currentDateTime().toString("yyyyMMddHHmmsszzz"));
+    }
+
+    const QString base64 = jsonObj.value("data").toString();
+    const QByteArray raw = QByteArray::fromBase64(base64.toLatin1());
+    if (raw.size() < 64 || raw.size() > 4 * 1024 * 1024) {
+        resObj.insert("msg", QString("头像数据大小异常（%1 字节）").arg(raw.size()));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    const QImage headImage = NormalizedHead(raw);
+    if (headImage.isNull()) {
+        resObj.insert("msg", QString("头像图片解析失败，请换一张图片"));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    const QString savePath = MyApp::HeadFullPath(head);
+    QDir().mkpath(MyApp::m_strHeadPath);
+    if (!headImage.save(savePath, "PNG")) {
+        resObj.insert("msg", QString("头像保存失败：%1").arg(savePath));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        qWarning() << "[头像] 保存失败：" << savePath;
+        return;
+    }
+
+    if (!DataBaseMag::getInstance()->updateUserHead(userId, head)) {
+        resObj.insert("msg", QString("头像更新失败，请稍后重试"));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    // 清掉这个用户以前上传的头像文件（不碰 default.png）
+    const QStringList oldFiles = QDir(MyApp::m_strHeadPath)
+                                     .entryList(QStringList() << QString("head_%1_*").arg(userId), QDir::Files);
+    for (const QString &oldFile : oldFiles) {
+        if (oldFile != head) {
+            QFile::remove(MyApp::m_strHeadPath + oldFile);
+        }
+    }
+
+    qInfo() << "[头像] 用户" << userId << "更新头像：" << head;
+
+    resObj.insert("head", head);
+    SltSendMessage(UpdateHeadOk, QJsonValue(resObj));
+
+    // 广播给其它在线用户，让他们把头像换过来
+    emit signalHeadChanged(userId, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseGetUserHead
+ * 客户端本地缺头像文件时向服务器拉取图片内容
+ */
+void ClientSocket::ParseGetUserHead(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) {
+        return;
+    }
+    QJsonObject reqObj = dataVal.toObject();
+    const int userId = reqObj.value("id").toInt();
+    if (userId <= 0) {
+        return;
+    }
+
+    QString head = DataBaseMag::getInstance()->getUserHead(userId);
+    QString path = MyApp::HeadFullPath(head);
+    if (head.isEmpty() || !QFile::exists(path)) {
+        // 数据库里没有、或文件不存在，统一回默认头像
+        head = QStringLiteral("default.png");
+        path = MyApp::EnsureDefaultHead();
+    }
+
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QJsonObject resObj;
+        resObj.insert("id", userId);
+        resObj.insert("msg", QString("服务器没有该用户的头像文件"));
+        SltSendMessage(HeadOperateFailed, QJsonValue(resObj));
+        qWarning() << "[头像] 读取头像失败：" << path;
+        return;
+    }
+    const QByteArray data = file.readAll();
+    file.close();
+
+    QJsonObject resObj;
+    resObj.insert("id", userId);
+    resObj.insert("head", head);
+    resObj.insert("data", QString::fromLatin1(data.toBase64()));
+    SltSendMessage(HeadData, QJsonValue(resObj));
+
+    qDebug() << "[头像] 下发头像给用户" << userId << "文件" << head << "大小" << data.size();
 }
 
 void ClientSocket::ParseReister(const QJsonValue &dataVal)
@@ -456,6 +1046,23 @@ void ClientSocket::ParseFaceMessages(const QByteArray &reply)
 
 }
 
+/**
+ * @brief ClientSocket::sendAck
+ * 消息已被服务端受理：把 key 原样回给发送者。
+ * 客户端据此把气泡从"发送中"改成"已送达"，超时未收到就标红提示重发。
+ * 老客户端不带 key，这里直接跳过，不影响兼容。
+ */
+void ClientSocket::sendAck(const QJsonObject &jsonObj)
+{
+    const QString key = jsonObj.value("key").toString();
+    if (key.isEmpty()) return;
+
+    QJsonObject ack;
+    ack.insert("key", key);
+    ack.insert("type", jsonObj.value("type").toInt());
+    SltSendMessage(SendAck, QJsonValue(ack));
+}
+
 void ClientSocket::ParseSendMsg(const QJsonValue &dataVal)
 {
     if(!dataVal.isObject()){
@@ -463,15 +1070,33 @@ void ClientSocket::ParseSendMsg(const QJsonValue &dataVal)
         return;
     }
     QJsonObject jsonObj = dataVal.toObject();
+    const int targetId = jsonObj.value("id").toInt();
+
     QJsonObject resObj;
     resObj.insert("id", m_nId);
-    resObj.insert("msg",jsonObj.value("msg"));
+    // id 换成发送者，其余字段（msg/type/color/size/enc）一律原样透传。
+    // 少带 type 接收端就会把图片当文字渲染成 base64，少带 color 自定义颜色也会丢。
+    for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
+    {
+        const QString key = it.key();
+        if (key == "id" || key == "to") continue;
+        resObj.insert(key, it.value());
+    }
     resObj.insert("head", DataBaseMag::getInstance()->getUserHead(m_nId));
 
 //    qDebug() << "发送的head" <<  DataBaseMag::getInstance()->getUserHead(m_nId) << "\n";
 
-    emit signalPrivateMsgToClient(m_nId, jsonObj.value("id").toInt(),SendMsg, QJsonValue(resObj));
+    // 审计日志：只记录密文，管理员需要时再用托管私钥解密
+    // 这里记录的是消息类型（Text/Face/Files…），不是协议类型
+    const quint8 msgType = static_cast<quint8>(jsonObj.value("type").toInt());
+    DataBaseMag::getInstance()->insertMsgLog(
+        m_nId, targetId, false, msgType,
+        QString::fromUtf8(QJsonDocument(resObj).toJson(QJsonDocument::Compact)));
 
+    emit signalPrivateMsgToClient(m_nId, targetId, SendMsg, QJsonValue(resObj));
+
+    // 已受理，给发送者一个回执
+    sendAck(jsonObj);
 }
 
 void ClientSocket::ParseSendFace(const QJsonValue &dataVal)
@@ -481,12 +1106,23 @@ void ClientSocket::ParseSendFace(const QJsonValue &dataVal)
         return;
     }
     QJsonObject jsonObj = dataVal.toObject();
+
+    // 原样透传（跳过 id/to，id 换成发送者），不要再手工重建 JSON：
+    // key 是撤回时定位消息的唯一标识，丢了它对方就撤不掉；color/size 等同理。
     QJsonObject resObj;
     resObj.insert("id", m_nId);
-    resObj.insert("msg", QString::number(jsonObj.value("msg").toInt()));
+    for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
+    {
+        const QString key = it.key();
+        if (key == "id" || key == "to") continue;
+        // msg 字段是端到端密文，服务器不解析、不改写，原样透传
+        resObj.insert(key, it.value());
+    }
     resObj.insert("head", DataBaseMag::getInstance()->getUserHead(m_nId));
-    resObj.insert("type", jsonObj.value("type").toInt());
+
     emit signalPrivateMsgToClient(m_nId, jsonObj.value("id").toInt(),SendFace, QJsonValue(resObj));
+
+    sendAck(jsonObj);
 }
 
 void ClientSocket::ParseSendFile(const QJsonValue &dataVal)
@@ -496,14 +1132,63 @@ void ClientSocket::ParseSendFile(const QJsonValue &dataVal)
         return;
     }
     QJsonObject jsonObj = dataVal.toObject();
+
+    // 同样整包透传：key（撤回定位）、size、type 一次带齐
     QJsonObject resObj;
-    resObj.insert("id", jsonObj.value("id").toInt());
-    resObj.insert("msg", jsonObj.value("msg").toString());
+    resObj.insert("id", m_nId);
+    for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
+    {
+        const QString key = it.key();
+        if (key == "id" || key == "to") continue;
+        resObj.insert(key, it.value());
+    }
     resObj.insert("head", DataBaseMag::getInstance()->getUserHead(m_nId));
-    resObj.insert("size", jsonObj.value("size").toString());
-    resObj.insert("type", jsonObj.value("type").toInt());
 
     emit signalPrivateMsgToClient(m_nId, jsonObj.value("to").toInt(), SendFile, QJsonValue(resObj));
+
+    sendAck(jsonObj);
+}
+
+/**
+ * @brief ClientSocket::ParseRecallMsg
+ * 撤回通知：只带 msg_key，服务端不解析内容，按私聊/群聊转发给对端
+ * 对端离线时和普通消息一样进离线队列，下次登录补投
+ */
+void ClientSocket::ParseRecallMsg(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject())
+    {
+        qDebug() << "撤回消息格式错误";
+        return;
+    }
+
+    QJsonObject jsonObj = dataVal.toObject();
+    const QString key = jsonObj.value("key").toString();
+    if (key.isEmpty())
+    {
+        qDebug() << "[撤回] 缺少 key，忽略";
+        return;
+    }
+
+    const bool isGroup = (jsonObj.value("group").toInt() != 0);
+    const int targetId = jsonObj.value("id").toInt();
+
+    QJsonObject resObj;
+    resObj.insert("id", m_nId);     // 发起人
+    resObj.insert("key", key);
+    resObj.insert("group", isGroup ? 1 : 0);
+
+    if (isGroup)
+    {
+        resObj.insert("gid", targetId);
+        qDebug() << "[撤回] 用户" << m_nId << "撤回群" << targetId << "消息" << key;
+        emit signalGroupMsgToClient(m_nId, targetId, RecallMsg, QJsonValue(resObj));
+    }
+    else
+    {
+        qDebug() << "[撤回] 用户" << m_nId << "撤回发给" << targetId << "的消息" << key;
+        emit signalPrivateMsgToClient(m_nId, targetId, RecallMsg, QJsonValue(resObj));
+    }
 }
 
 void ClientSocket::ParseSendGroupMsg(const QJsonValue &dataVal)
@@ -522,5 +1207,102 @@ void ClientSocket::ParseSendGroupMsg(const QJsonValue &dataVal)
     jsonObj.insert("userId", m_nId);
     jsonObj.insert("name", DataBaseMag::getInstance()->getUsernameFromId(QString::number(m_nId)));
     qDebug() << type;
+
+    // 审计日志：群聊同样只记录密文原文
+    DataBaseMag::getInstance()->insertMsgLog(
+        m_nId, groupId, true, static_cast<quint8>(type),
+        QString::fromUtf8(QJsonDocument(jsonObj).toJson(QJsonDocument::Compact)));
+
     emit signalGroupMsgToClient(m_nId, groupId, SendGroupMsg, QJsonValue(jsonObj));
+
+    sendAck(jsonObj);
+}
+
+/**
+ * @brief ClientSocket::ParseQuitGroup
+ * 退出群组：普通成员才能退，群主只能用"解散群聊"
+ */
+void ClientSocket::ParseQuitGroup(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) {
+        qDebug() << "退出群组数据有误";
+        return;
+    }
+    QJsonObject jsonObj = dataVal.toObject();
+    const int groupId = jsonObj.value("groupId").toInt();
+    if (groupId < 0) {
+        qDebug() << "退出群组失败，群号无效";
+        return;
+    }
+
+    QJsonObject resObj;
+    resObj.insert("groupId", groupId);
+
+    const int ownerId = DataBaseMag::getInstance()->getGroupOwner(groupId);
+    if (ownerId == m_nId) {
+        resObj.insert("msg", QString("你是群主，不能退出群聊，请使用解散群聊"));
+        SltSendMessage(GroupOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    if (!DataBaseMag::getInstance()->removeGroupMember(groupId, m_nId)) {
+        resObj.insert("msg", QString("退出群组失败，请稍后重试"));
+        SltSendMessage(GroupOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    // 同步服务端的群成员缓存
+    emit signalRemoveGroupMembers(groupId, m_nId);
+
+    qDebug() << "用户" << m_nId << "退出群组" << groupId;
+    SltSendMessage(QuitGroupOk, QJsonValue(resObj));
+}
+
+/**
+ * @brief ClientSocket::ParseDissolveGroup
+ * 解散群组：只有群主可以，解散后通知所有成员
+ */
+void ClientSocket::ParseDissolveGroup(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) {
+        qDebug() << "解散群组数据有误";
+        return;
+    }
+    QJsonObject jsonObj = dataVal.toObject();
+    const int groupId = jsonObj.value("groupId").toInt();
+    if (groupId < 0) {
+        qDebug() << "解散群组失败，群号无效";
+        return;
+    }
+
+    QJsonObject resObj;
+    resObj.insert("groupId", groupId);
+
+    if (DataBaseMag::getInstance()->getGroupOwner(groupId) != m_nId) {
+        resObj.insert("msg", QString("只有群主才能解散群聊"));
+        SltSendMessage(GroupOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    // 先通知其它成员（此时缓存还没删，组播才有对象）
+    QJsonObject noticeObj;
+    noticeObj.insert("groupId", groupId);
+    noticeObj.insert("name", DataBaseMag::getInstance()->getGroupName(groupId));
+    emit signalGroupMsgToClient(m_nId, groupId, GroupDissolved, QJsonValue(noticeObj));
+
+    // 清缓存 + 删库
+    QJsonValue members = DataBaseMag::getInstance()->getGroupMember(groupId);
+    if (members.isArray()) {
+        const QJsonArray arr = members.toArray();
+        for (const QJsonValue &item : arr) {
+            const int memberId = item.toObject().value("userId").toInt();
+            if (memberId > 0) {
+                emit signalRemoveGroupMembers(groupId, memberId);
+            }
+        }
+    }
+    DataBaseMag::getInstance()->removeGroup(groupId);
+
+    qDebug() << "群组" << groupId << "已被群主" << m_nId << "解散";
+    SltSendMessage(DissolveGroupOk, QJsonValue(resObj));
 }

@@ -4,6 +4,7 @@
 #include <QHostInfo>
 #include <QJsonValue>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QDir>
 #include "databasemag.h"
 #include "comapi/unit.h"
@@ -24,26 +25,127 @@ MyServer::~MyServer()
 
 bool MyServer::StartListen(int port)
 {
-    m_tcpServer->listen(QHostAddress::Any, static_cast<quint16>(port));
-    qDebug() << "开启监听" << port;
+    if (m_tcpServer->isListening()) {
+        m_tcpServer->close();
+    }
+    if (!m_tcpServer->listen(QHostAddress::Any, static_cast<quint16>(port))) {
+        qWarning() << "[服务器] 监听端口失败：" << port << m_tcpServer->errorString();
+        return false;
+    }
+    qDebug() << "[服务器] 开启监听" << port;
     return true;
 }
 
 void MyServer::CloseListen()
 {
+    if (!m_tcpServer->isListening()) {
+        return;
+    }
     m_tcpServer->close();
+    qDebug() << "[服务器] 已停止监听";
+}
+
+bool MyServer::isListening() const
+{
+    return m_tcpServer && m_tcpServer->isListening();
+}
+
+int MyServer::listenPort() const
+{
+    return (m_tcpServer && m_tcpServer->isListening()) ? m_tcpServer->serverPort() : -1;
 }
 
 // 消息服务器
+TcpMsgServer *TcpMsgServer::s_instance = nullptr;
+
 TcpMsgServer::TcpMsgServer(QObject *parent)
 {
+    s_instance = this;
     m_groupMembersCache = DataBaseMag::getInstance()->initGroupMembersCache();
     qDebug() << m_groupMembersCache;
+
+    // 心跳扫描：客户端每 15 秒发一次心跳，这里超过 60 秒没动静就判定为掉线。
+    // 进程被强杀、网线被拔这类情况，TCP 层可能很久都感知不到，只能靠心跳兜底。
+    m_heartbeatTimer = new QTimer(this);
+    m_heartbeatTimer->setInterval(20000);
+    connect(m_heartbeatTimer, &QTimer::timeout, this, &TcpMsgServer::sweepIdleClients);
+    m_heartbeatTimer->start();
+}
+
+TcpMsgServer *TcpMsgServer::instance()
+{
+    return s_instance;
+}
+
+bool TcpMsgServer::isUserOnline(int userId) const
+{
+    if (userId <= 0) return false;
+    return m_clientHash.contains(QString::number(userId));
+}
+
+/**
+ * @brief 清理长时间没有任何数据（含心跳）的连接
+ * 这一步保证"用户已经不存在了"时，服务器上的在线状态会自己恢复，而不是一直挂着。
+ */
+void TcpMsgServer::sweepIdleClients()
+{
+    if (m_clientHash.isEmpty()) return;
+
+    const QDateTime now = QDateTime::currentDateTime();
+    QList<ClientSocket *> stale;
+    for (auto it = m_clientHash.constBegin(); it != m_clientHash.constEnd(); ++it) {
+        ClientSocket *client = it.value();
+        if (!client) continue;
+        if (client->lastActiveTime().secsTo(now) >= 60)
+            stale.append(client);
+    }
+
+    for (ClientSocket *client : stale) {
+        const int userId = client->GetUserId();
+        const QString userName = DataBaseMag::getInstance()->getUsernameFromId(QString::number(userId));
+        qInfo() << "[心跳] 连接超时，判定下线：" << userId << userName;
+
+        // 先从连接表摘掉并置离线，再断开；断开回调里会因为 hash 已不含它而跳过重复处理
+        if (m_clientHash.value(QString::number(userId)) == client)
+            m_clientHash.remove(QString::number(userId));
+        if (userId > 0)
+            DataBaseMag::getInstance()->UpdateUserStatus(userId, OffLine);
+
+        emit signalServerLog(QString("用户 %1 心跳超时，已判定离线（在线 %2 人）")
+                             .arg(userName.isEmpty() ? QString::number(userId) : userName)
+                             .arg(m_clientHash.size()));
+        client->kick();
+    }
+
+    if (!stale.isEmpty())
+        emit signalClientChanged(m_clientHash.size(), m_clients.size());
 }
 
 TcpMsgServer::~TcpMsgServer()
 {
+    if (s_instance == this) s_instance = nullptr;
 }
+
+int TcpMsgServer::onlineCount() const
+{
+    return m_clientHash.size();
+}
+
+int TcpMsgServer::socketCount() const
+{
+    return m_clients.size();
+}
+
+/**
+ * @brief TcpMsgServer::reloadGroupCache
+ * 数据库被还原 / 群成员表被外部修改后，刷新内存中的群成员缓存
+ */
+void TcpMsgServer::reloadGroupCache()
+{
+    m_groupMembersCache = DataBaseMag::getInstance()->initGroupMembersCache();
+    qInfo() << "[群缓存] 已刷新，群数量：" << m_groupMembersCache.size();
+}
+
 
 void TcpMsgServer::insertMessageQueue(const int &send, const int &getId, const QJsonValue &jsonVal, const quint8 &type)
 {
@@ -99,7 +201,8 @@ void TcpMsgServer::SltTransFileToClient(const int &userId, const QJsonValue &jso
 
 void TcpMsgServer::SltNewConnection()
 {
-    ClientSocket *client = new ClientSocket(this, m_tcpServer->nextPendingConnection());
+    QTcpSocket *socket = m_tcpServer->nextPendingConnection();
+    ClientSocket *client = new ClientSocket(this, socket);
     m_clients.append(client); // 加入客户端列表管理
 
     // 信号槽绑定
@@ -110,8 +213,15 @@ void TcpMsgServer::SltNewConnection()
     connect(client, &ClientSocket::signalGroupMsgToClient, this, &TcpMsgServer::SltGroupMsgToClient);
     connect(client, &ClientSocket::signalAddGroupMembers, this, &TcpMsgServer::SltAddGroupMembers);
     connect(client, &ClientSocket::signalRemoveGroupMembers, this, &TcpMsgServer::SltRemoveGroupMembers);
+    connect(client, &ClientSocket::signalHeadChanged, this, &TcpMsgServer::SltHeadChangedToClient);
 
-    qDebug() << "[消息服务器] 新客户端连接！socketDescriptor：";
+    QString addr = "未知地址";
+    if (socket) {
+        addr = QString("%1:%2").arg(socket->peerAddress().toString()).arg(socket->peerPort());
+    }
+    qDebug() << "[消息服务器] 新客户端连接！socketDescriptor：" << addr;
+    emit signalServerLog(QString("新的客户端连接：%1").arg(addr));
+    emit signalClientChanged(m_clientHash.size(), m_clients.size());
 }
 
 void TcpMsgServer::SltConnected()
@@ -121,16 +231,44 @@ void TcpMsgServer::SltConnected()
 void TcpMsgServer::SltDisConnected()
 {
     ClientSocket *client = (ClientSocket *)this->sender();
+    const int userId = client ? client->GetUserId() : -1;
+    const QString userName = (userId > 0)
+            ? DataBaseMag::getInstance()->getUsernameFromId(QString::number(userId))
+            : QString();
+
     m_clients.removeOne(client);
-    m_clientHash.remove(QString::number(client->GetUserId()));
-    disconnect(client, &ClientSocket::signalConnected, this, &TcpMsgServer::SltConnected);
-    disconnect(client, &ClientSocket::signalDisConnected, this, &TcpMsgServer::SltDisConnected);
-    disconnect(client, &ClientSocket::signalLoginSuccess, this, &TcpMsgServer::SltLoginSuccess);
-    disconnect(client, &ClientSocket::signalPrivateMsgToClient, this, &TcpMsgServer::SltPrivateMsgToClient);
-    disconnect(client, &ClientSocket::signalGroupMsgToClient, this, &TcpMsgServer::SltGroupMsgToClient);
-    disconnect(client, &ClientSocket::signalAddGroupMembers, this, &TcpMsgServer::SltAddGroupMembers);
-    disconnect(client, &ClientSocket::signalRemoveGroupMembers, this, &TcpMsgServer::SltRemoveGroupMembers);
-    client->deleteLater();
+
+    // 只有当连接表里记录的正是这条连接时才算真正下线。
+    // 同一账号被顶号后，旧连接迟到的断开通知不能把新连接从在线表里删掉。
+    bool reallyOffline = false;
+    if (userId > 0 && m_clientHash.value(QString::number(userId)) == client) {
+        m_clientHash.remove(QString::number(userId));
+        DataBaseMag::getInstance()->UpdateUserStatus(userId, OffLine);
+        reallyOffline = true;
+    }
+
+    if (client) {
+        disconnect(client, &ClientSocket::signalConnected, this, &TcpMsgServer::SltConnected);
+        disconnect(client, &ClientSocket::signalDisConnected, this, &TcpMsgServer::SltDisConnected);
+        disconnect(client, &ClientSocket::signalLoginSuccess, this, &TcpMsgServer::SltLoginSuccess);
+        disconnect(client, &ClientSocket::signalPrivateMsgToClient, this, &TcpMsgServer::SltPrivateMsgToClient);
+        disconnect(client, &ClientSocket::signalGroupMsgToClient, this, &TcpMsgServer::SltGroupMsgToClient);
+        disconnect(client, &ClientSocket::signalAddGroupMembers, this, &TcpMsgServer::SltAddGroupMembers);
+        disconnect(client, &ClientSocket::signalRemoveGroupMembers, this, &TcpMsgServer::SltRemoveGroupMembers);
+        disconnect(client, &ClientSocket::signalHeadChanged, this, &TcpMsgServer::SltHeadChangedToClient);
+        client->deleteLater();
+    }
+
+    if (!reallyOffline && userId > 0) {
+        emit signalServerLog(QString("用户 %1 的旧连接已断开（新连接保持在线，在线 %2 人）")
+                             .arg(userName.isEmpty() ? QString::number(userId) : userName)
+                             .arg(m_clientHash.size()));
+    } else {
+        emit signalServerLog(userName.isEmpty()
+                             ? QString("一个客户端断开连接（在线 %1）").arg(m_clientHash.size())
+                             : QString("用户 %1 已下线（在线 %2）").arg(userName).arg(m_clientHash.size()));
+    }
+    emit signalClientChanged(m_clientHash.size(), m_clients.size());
 }
 
 void TcpMsgServer::SltPublicMsgToClient(const int &id, const quint8 &type, const QJsonValue &json)
@@ -165,8 +303,48 @@ void TcpMsgServer::SltGroupMsgToClient(const int &id, const int &groupId, const 
         return;
     }
     qDebug() << "组播" << id << groupId << json;
-    QSet<int> groupSet = m_groupMembersCache[groupId];
+    QSet<int> groupSet = m_groupMembersCache.value(groupId);
+
+    // 缓存里没有这个群（例如成员是服务器运行期间直接写库加进来的、或缓存还没初始化），
+    // 回退查一次数据库，否则消息会被静默丢掉，其它成员永远收不到
+    if (groupSet.isEmpty())
+    {
+        QJsonValue members = DataBaseMag::getInstance()->getGroupMember(groupId);
+        if (members.isArray())
+        {
+            const QJsonArray arr = members.toArray();
+            for (const QJsonValue &item : arr)
+            {
+                const int memberId = item.toObject().value("userId").toInt();
+                if (memberId > 0)
+                {
+                    groupSet.insert(memberId);
+                }
+            }
+        }
+        if (!groupSet.isEmpty())
+        {
+            m_groupMembersCache[groupId] = groupSet;
+            qDebug() << "[群聊] 群组" << groupId << "从数据库补载成员：" << groupSet;
+        }
+    }
+
+    if (groupSet.isEmpty())
+    {
+        qWarning() << "[群聊] 群组" << groupId
+                   << "没有任何成员（GROUP_MEMBER 为空），消息无法转发给其他人";
+        return;
+    }
+
     QList<int> memberList = groupSet.toList();
+    qDebug() << "[群聊] 群组" << groupId << "成员：" << memberList << " 发送者：" << id;
+
+    // 群里只有发送者自己：没有别人可转发，这种多半是群成员没加上，日志里明确提示一下
+    if (memberList.size() <= 1)
+    {
+        qWarning() << "[群聊] 群组" << groupId
+                   << "只有" << memberList.size() << "个成员，其他人收不到该消息";
+    }
     for (int i = 0; i < memberList.size(); i += BATCH_SIZE) {
         // 截取当前批次的成员ID
         QList<int> batch = memberList.mid(i, BATCH_SIZE);
@@ -192,6 +370,24 @@ void TcpMsgServer::SltGroupMsgToClient(const int &id, const int &groupId, const 
 
 }
 
+/**
+ * @brief TcpMsgServer::SltHeadChangedToClient
+ * 某个用户换了头像：通知所有其它在线用户，让他们把列表/聊天里的头像换过来
+ */
+void TcpMsgServer::SltHeadChangedToClient(const int &id, const QJsonValue &jsonVal)
+{
+    int notified = 0;
+    for (auto it = m_clientHash.begin(); it != m_clientHash.end(); ++it)
+    {
+        if (!it.value() || it.key().toInt() == id) {
+            continue;   // 跳过改头像的人自己
+        }
+        it.value()->SltSendMessage(HeadChanged, QJsonValue(jsonVal));
+        ++notified;
+    }
+    qDebug() << "[头像] 已通知" << notified << "个在线用户：用户" << id << "换了头像";
+}
+
 void TcpMsgServer::SltLoginSuccess(ClientSocket *client, const QString &userId)
 {
     if (!client || userId.isEmpty())
@@ -201,14 +397,28 @@ void TcpMsgServer::SltLoginSuccess(ClientSocket *client, const QString &userId)
         return;
     }
 
-    if (m_clientHash.contains(userId))
+    // 同一账号已有连接：顶号处理。
+    // 以前这里是直接 return，导致新连接虽然登录成功却不在在线表里——
+    // 界面上显示"在线"，实际收不到任何消息，发出去的消息全进了离线队列。
+    ClientSocket *old = m_clientHash.value(userId, nullptr);
+    if (old && old != client)
     {
-        qDebug() << "不能重复登录";
-        return;
+        qInfo() << "[顶号] 用户" << userId << "重新登录，踢掉旧连接";
+        m_clientHash.remove(userId);        // 先摘掉，旧连接迟到的断开回调就不会影响在线表
+        m_clients.removeOne(old);
+        old->kick();
     }
+
     m_clientHash.insert(userId, client);
+    DataBaseMag::getInstance()->UpdateUserStatus(userId.toInt(), OnLine);
     sendUserMessageQueue(userId);
+
+    const QString userName = DataBaseMag::getInstance()->getUsernameFromId(userId);
     qDebug() << "客户端登录成功，ID：" << userId << "，当前在线数：" << m_clientHash.size();
+    emit signalServerLog(QString("用户 %1（ID:%2）在线，当前在线 %3 人")
+                         .arg(userName.isEmpty() ? QStringLiteral("未知") : userName)
+                         .arg(userId).arg(m_clientHash.size()));
+    emit signalClientChanged(m_clientHash.size(), m_clients.size());
 }
 
 TcpFileServer::TcpFileServer(QObject *parent)

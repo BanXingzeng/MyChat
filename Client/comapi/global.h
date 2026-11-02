@@ -32,6 +32,7 @@
 #include <QPainter>
 #include <QBitmap>
 #include <QPixmap>
+#include <QRandomGenerator>
 
 #include "myapp.h"
 #include "unit.h"
@@ -328,6 +329,65 @@ public:
         return QPixmap::fromImage(newImage);
     }
 
+
+    // 图片消息用：把 "b64:<base64>" 落盘到 Data/Images，返回本地路径。
+    // 不是内嵌格式时原样返回；落盘失败也原样返回（气泡控件能直接渲染 b64）
+    static QString SaveInlineImage(const QString &msgText)
+    {
+        if (!msgText.startsWith("b64:")) return msgText;
+
+        const QByteArray raw = QByteArray::fromBase64(msgText.mid(4).toLatin1());
+        if (raw.isEmpty()) return msgText;
+
+        const QString dir = MyApp::m_strDataPath + "Images/";
+        QDir().mkpath(dir);
+
+        const QString path = QDir(dir).filePath(
+            QString("img_%1_%2.png")
+                .arg(QDateTime::currentMSecsSinceEpoch())
+                .arg(QRandomGenerator::global()->bounded(100000)));
+
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly))
+        {
+            qWarning() << "[图片] 落盘失败" << path;
+            return msgText;
+        }
+        f.write(raw);
+        f.close();
+
+        // 聊天里存的必须是绝对路径：工作目录一变相对路径就失效
+        return QFileInfo(path).absoluteFilePath();
+    }
+
+    // 语音消息用：把 "b64:<base64>" 落盘成 wav，返回本地路径。
+    // 不是内嵌格式时原样返回（气泡控件能直接播 b64）。
+    static QString SaveInlineAudio(const QString &msgText)
+    {
+        if (!msgText.startsWith("b64:")) return msgText;
+
+        const QByteArray raw = QByteArray::fromBase64(msgText.mid(4).toLatin1());
+        if (raw.isEmpty()) return msgText;
+
+        const QString dir = MyApp::m_strDataPath + "Record/";
+        QDir().mkpath(dir);
+
+        const QString path = QDir(dir).filePath(
+            QString("audio_%1_%2.wav")
+                .arg(QDateTime::currentMSecsSinceEpoch())
+                .arg(QRandomGenerator::global()->bounded(100000)));
+
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly))
+        {
+            qWarning() << "[语音] 落盘失败" << path;
+            return msgText;
+        }
+        f.write(raw);
+        f.close();
+
+        return QFileInfo(path).absoluteFilePath();
+    }
 
     // 文件大小转换
     static QString CalcSize(qint64 bytes)

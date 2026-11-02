@@ -4,6 +4,7 @@
 #include <QDebug>
 #include <QEvent>
 #include <QPainter>
+#include <QFontMetrics>
 
 QQListViewChild::QQListViewChild(QQPopMenuWidget *parent) :
     QQPopMenuWidget(parent)
@@ -52,6 +53,11 @@ void QQListViewChild::paintEvent(QPaintEvent *)
 {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
+
+    if (nullptr == cell) {
+        return;
+    }
+
     painter.fillRect(this->rect(), m_bEntered ? QColor("#D9D8D7") : QColor("transparent"));
     QPixmap pixmap(cell->iconPath);
     if (pixmap.isNull()) pixmap = QPixmap(":/resource/head/1.bmp");
@@ -83,4 +89,24 @@ void QQListViewChild::paintEvent(QPaintEvent *)
     painter.setPen(pen);
     painter.setFont(font);
     painter.drawText(70, h / 2 + 2, w - 70, h / 2 - 2, Qt::AlignTop, cell->subTitle);
+
+    // 绘制未读消息角标（右上角红点，超过 99 显示 99+）
+    if (cell->unread > 0) {
+        const QString badgeText = cell->unread > 99 ? QString("99+")
+                                                    : QString::number(cell->unread);
+        QFont badgeFont("微软雅黑", 9);
+        badgeFont.setBold(true);
+        QFontMetrics fm(badgeFont);
+        const int badgeH = 16;
+        const int badgeW = qMax(badgeH, fm.horizontalAdvance(badgeText) + 10);
+        QRect badgeRect(w - badgeW - 10, h / 2 - badgeH / 2 - 8, badgeW, badgeH);
+
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor("#F5222D"));
+        painter.drawRoundedRect(badgeRect, badgeH / 2.0, badgeH / 2.0);
+
+        painter.setPen(QColor("#FFFFFF"));
+        painter.setFont(badgeFont);
+        painter.drawText(badgeRect, Qt::AlignCenter, badgeText);
+    }
 }

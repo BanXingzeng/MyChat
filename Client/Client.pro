@@ -4,12 +4,19 @@
 #
 #-------------------------------------------------
 
-QT       += core gui
+QT       += core gui multimedia
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 TARGET = Client
 TEMPLATE = app
+
+# Windows 可执行文件图标（qmake 会自动生成 Client_resource.rc 并用 windres 编译）
+# 注意：RESOURCES 里的 images.qrc 只负责程序运行时的图标，不生成 exe 的文件图标
+win32: RC_ICONS = $$PWD/resource/ico/app.ico
+
+# DPAPI（CryptProtectData）：config.ini 里的登录口令用它加密，不再明文落盘
+win32: LIBS += -lcrypt32
 
 # The following define makes your compiler emit warnings if you use
 # any feature of Qt which has been marked as deprecated (the exact warnings
@@ -46,6 +53,9 @@ include(comapi/comapi.pri)
 include(basewidget/basewidget.pri)
 include(netdb/netdb.pri)
 include(uipage/uipage.pri)
+
+# OpenSSL 4.1.0 (Win32) —— 消息端到端加密
+include($$PWD/../3rdparty/openssl32/openssl.pri)
 
 RESOURCES += \
     images.qrc

@@ -88,6 +88,7 @@ void QQListWidget::clearAllCells()
     }
 
     cells.clear();  //清空数据，防止访问野指针
+    m_nRightClickCell = nullptr;    // 右键选中的 cell 已经被释放了
 
     clearListWidgetItems();
 }
@@ -137,7 +138,8 @@ void QQListWidget::upload()
             }
             else
             {
-                group->ui->groupTitleLabel->setText(QString("%1[%2/%2]").arg(cell->groupName).arg(cell->childs.size()));
+                // 扩展组（如"我的群组"、"最近会话"）只显示组名，不显示人数统计
+                group->ui->groupTitleLabel->setText(cell->groupName);
                 group->ui->groupSubTitleLabel->setText(QString(""));
             }
             group->setQQCell(cell);

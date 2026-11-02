@@ -65,11 +65,14 @@ void CustomMoveWidget::setQss(const QString &filePath)
 {
     QFile file(filePath);
     if(!file.open(QIODevice::ReadOnly)){
-        qDebug() << "Qss文件打开失败";
+        qDebug() << "Qss文件打开失败:" << filePath;
         return;
     }
-    QTextStream stream(&file);
-    setStyleSheet(stream.readAll());
+    // 样式表文件是 UTF-8 编码，必须显式按 UTF-8 解码。
+    // 用 QTextStream 的默认编码（Windows 简体中文下是 GBK）读会把中文注释解坏，
+    // 注释结束符 "*/" 里的 '*' 会被当成 GBK 双字节字符的一部分吃掉，
+    // 导致注释无法闭合，后面大段选择器被整体当成注释，表现为 QSS 不生效。
+    setStyleSheet(QString::fromUtf8(file.readAll()));
     file.close();
 }
 

@@ -6,6 +6,17 @@
 #include <QDebug>
 #include "comapi/global.h"
 
+// 大端 8 字节整数。与 QDataStream 默认字节序一致，
+// 但不受"append 到 QByteArray 后 QDataStream 位置未同步"的影响。
+static QByteArray be64(qint64 v)
+{
+    QByteArray b(8, 0);
+    const quint64 u = static_cast<quint64>(v);
+    for (int i = 0; i < 8; ++i)
+        b[i] = static_cast<char>((u >> (56 - 8 * i)) & 0xFF);
+    return b;
+}
+
 FileSocket::FileSocket(QObject *parent) : QObject(parent)
 {
     // 延迟在工作线程中创建 Socket，避免线程亲和性问题
@@ -102,6 +113,25 @@ void FileSocket::setSavePath(const QString &saveDir)
     m_saveDir = saveDir;
 }
 
+void FileSocket::setEncryptSession(const QByteArray &key, const QByteArray &iv,
+                                   const QByteArray &metaJson)
+{
+    m_sendKey  = key;
+    m_sendIv   = iv;
+    m_sendMeta = metaJson;
+}
+
+void FileSocket::setDecryptIdentity(int userId, const QString &privPem)
+{
+    m_decryptUid  = userId;
+    m_decryptPriv = privPem;
+}
+
+bool FileSocket::hasEncryptSession() const
+{
+    return m_sendKey.size() == 32 && m_sendIv.size() == 16 && !m_sendMeta.isEmpty();
+}
+
 void FileSocket::onSocketConnected()
 {
     qDebug() << "文件服务器连接成功（子线程）：" << QThread::currentThreadId();
@@ -158,24 +188,35 @@ void FileSocket::startSendFile()
         return;
     }
 
-    // 构造包头：totalBytes(8字节) + filenameLen(8字节) + filename(UTF8原始字节)
-    m_totalBytes = m_fileToSend->size(); // 文件原始大小
-    m_outBlock.clear();
-    QDataStream sendOut(&m_outBlock, QIODevice::WriteOnly);
-    sendOut.setVersion(QDataStream::Qt_5_12);
+    const qint64 fileSize = m_fileToSend->size();
     QFileInfo fileInfo(m_filePath);
-    QString fileName = fileInfo.fileName();
-    QByteArray nameUtf8 = fileName.toUtf8(); // 文件名转UTF8字节
+    const QByteArray nameUtf8 = fileInfo.fileName().toUtf8();
 
-    // 先写入占位的total和filenameLen（后续回写真实值）
-    sendOut << qint64(0) << qint64(0);
-    m_outBlock.append(nameUtf8); // 追加文件名原始字节
-    qint64 headerSize = m_outBlock.size(); // 包头总大小（8+8+文件名字节数）
-    m_totalBytes += headerSize; // 总字节数 = 文件大小 + 包头大小
+    // 包头（大端）：
+    //   totalBytes(8) | filenameLen(8) | filename | metaLen(8) | meta
+    // meta 里是用接收者公钥包裹过的一次性会话密钥；服务端原样落盘，解不开。
+    m_outBlock.clear();
+    m_outBlock.append(be64(0));                          // 占位，稍后回写
+    m_outBlock.append(be64(nameUtf8.size()));
+    m_outBlock.append(nameUtf8);
+    m_outBlock.append(be64(m_sendMeta.size()));
+    m_outBlock.append(m_sendMeta);
 
-    // 回写真实的total和filenameLen
-    sendOut.device()->seek(0);
-    sendOut << m_totalBytes << qint64(nameUtf8.size());
+    const qint64 headerSize = m_outBlock.size();
+    m_totalBytes = static_cast<quint64>(fileSize) + static_cast<quint64>(headerSize);
+    m_outBlock.replace(0, 8, be64(static_cast<qint64>(m_totalBytes)));
+
+    // 打开加密流：CTR 密文与明文等长，进度和总字节数都不受影响
+    if (!m_sendMeta.isEmpty())
+    {
+        if (!m_stream.initEncrypt(m_sendKey, m_sendIv))
+        {
+            emit sendFailed(QString("初始化文件加密失败：%1").arg(CryptoUtil::lastError()));
+            m_fileToSend->close();
+            m_isSending = false;
+            return;
+        }
+    }
 
     // 初始化发送计数
     m_bytesWritten = 0;
@@ -197,9 +238,10 @@ void FileSocket::startSendFile()
     // 启动进度计时器（仅启动，无需重复连接）
     m_Time->start(100);
 
-    qDebug() << "开始发送文件：" << fileName
-             << "总字节数（含包头）：" << m_totalBytes
-             << "已发包头字节数：" << sendBytes;
+    qDebug() << "开始发送文件：" << fileInfo.fileName()
+             << "原始大小：" << fileSize
+             << "加密：" << (m_sendMeta.isEmpty() ? "否" : "是（AES-256-CTR）")
+             << "总字节数（含包头）：" << m_totalBytes;
 }
 
 void FileSocket::stopSendFile()
@@ -249,6 +291,19 @@ void FileSocket::onBytesWritten(qint64 numBytes)
             return;
         }
 
+        // 端到端加密：CTR 是流密码，逐块加密且长度不变
+        if (m_stream.isActive() && !m_outBlock.isEmpty())
+        {
+            const QByteArray cipher = m_stream.update(m_outBlock);
+            if (cipher.size() != m_outBlock.size())
+            {
+                emit sendFailed("文件加密异常：密文长度与明文不一致，传输中止");
+                stopSendFile();
+                return;
+            }
+            m_outBlock = cipher;
+        }
+
         // 写入Socket发送队列
         qint64 writeBytes = m_tcpSocket->write(m_outBlock);
         if (writeBytes < 0)
@@ -284,28 +339,62 @@ void FileSocket::onReadyRead()
     // 解析包头（未开始接收时）
     if (!m_isReceiving)
     {
+        const int kBase = static_cast<int>(sizeof(qint64) * 2);   // totalBytes + filenameLen
+
         // 包头不完整（至少需要8+8=16字节），等待后续数据
-        if (m_recvBuffer.size() < static_cast<int>(sizeof(qint64) * 2))
+        if (m_recvBuffer.size() < kBase)
             return;
 
-        // 解析总字节数和文件名长度
         QDataStream in(&m_recvBuffer, QIODevice::ReadOnly);
         in.setVersion(QDataStream::Qt_5_12);
         in >> m_recvTotalBytes; // 总字节数
         qint64 filenameLen = 0;
         in >> filenameLen;
 
-        // 文件名未完整接收，等待后续数据
-        if (m_recvBuffer.size() < static_cast<int>(sizeof(qint64) * 2 + filenameLen))
+        if (filenameLen <= 0 || filenameLen > 8192)
+        {
+            emit sendFailed("文件包头异常：文件名长度非法");
+            stopSendFile();
+            return;
+        }
+
+        // 文件名之后是 metaLen：>0 表示内容经过端到端加密，0 表示明文
+        const int nameEnd = kBase + static_cast<int>(filenameLen);
+        if (m_recvBuffer.size() < nameEnd + static_cast<int>(sizeof(qint64)))
             return;
 
-        // 提取文件名（UTF8原始字节转QString）
-        QByteArray nameBytes = m_recvBuffer.mid(static_cast<int>(sizeof(qint64) * 2),
-                                                static_cast<int>(filenameLen));
+        QDataStream inMeta(&m_recvBuffer, QIODevice::ReadOnly);
+        inMeta.setVersion(QDataStream::Qt_5_12);
+        inMeta.skipRawData(nameEnd);
+        qint64 metaLen = 0;
+        inMeta >> metaLen;
+
+        if (metaLen < 0 || metaLen > 64 * 1024)
+        {
+            emit sendFailed("文件包头异常：加密头长度非法");
+            stopSendFile();
+            return;
+        }
+
+        const int contentPos = nameEnd + static_cast<int>(sizeof(qint64)) + static_cast<int>(metaLen);
+        if (m_recvBuffer.size() < contentPos)
+            return;
+
+        const QByteArray nameBytes = m_recvBuffer.mid(kBase, static_cast<int>(filenameLen));
+        const QByteArray metaBytes = m_recvBuffer.mid(nameEnd + static_cast<int>(sizeof(qint64)),
+                                                      static_cast<int>(metaLen));
         QString fileName = QString::fromUtf8(nameBytes);
         if (fileName.isEmpty())
         {
             emit sendFailed("解析到空的文件名，接收文件失败");
+            stopSendFile();
+            return;
+        }
+
+        // 有加密头就必须先解出属于自己的会话密钥，否则后面全是乱码
+        if (!metaBytes.isEmpty() && !initRecvCrypto(metaBytes))
+        {
+            stopSendFile();
             return;
         }
 
@@ -345,23 +434,43 @@ void FileSocket::onReadyRead()
 
         // 初始化接收状态
         m_isReceiving = true;
-        // 已处理字节数 = 包头字节数（8+8+文件名长度）
-        m_recvProcessedBytes = sizeof(qint64) * 2 + filenameLen;
-        // 移除缓冲区中的包头数据，仅保留文件内容
-        m_recvBuffer = m_recvBuffer.mid(static_cast<int>(m_recvProcessedBytes));
+        // 已处理字节数 = 包头 + 加密头
+        m_recvProcessedBytes = contentPos;
+        // 移除缓冲区中的包头数据，仅保留文件内容（密文）
+        m_recvBuffer = m_recvBuffer.mid(contentPos);
         // 启动进度计时器
         m_Time->start(100);
 
         qDebug() << "开始接收文件：" << fileName
                  << "总字节数：" << m_recvTotalBytes
+                 << "加密：" << (metaBytes.isEmpty() ? "否" : "是（AES-256-CTR）")
                  << "保存路径：" << finalPath;
     }
 
     // 写入文件内容（已解析包头后）
     if (m_isReceiving && m_fileToRecv)
     {
-        // 将缓冲区数据写入文件
-        qint64 writeLen = m_fileToRecv->write(m_recvBuffer);
+        // 解密这一批数据（CTR 密文与明文等长，逐块解密）
+        QByteArray plain = m_recvBuffer;
+        if (m_stream.isActive() && !m_recvBuffer.isEmpty())
+        {
+            plain = m_stream.update(m_recvBuffer);
+            if (plain.isEmpty())
+            {
+                emit sendFailed(QString("文件解密失败，接收中止：%1").arg(CryptoUtil::lastError()));
+                m_fileToRecv->close();
+                m_fileToRecv->deleteLater();
+                m_fileToRecv = nullptr;
+                m_recvBuffer.clear();
+                m_isReceiving = false;
+                m_Time->stop();
+                return;
+            }
+        }
+        m_recvBuffer.clear();
+
+        // 将明文写入文件
+        qint64 writeLen = m_fileToRecv->write(plain);
         if (writeLen < 0)
         {
             emit sendFailed(QString("接收文件写入失败：%1").arg(m_fileToRecv->errorString()));
@@ -369,7 +478,6 @@ void FileSocket::onReadyRead()
             m_fileToRecv->close();
             m_fileToRecv->deleteLater();
             m_fileToRecv = nullptr;
-            m_recvBuffer.clear();
             m_isReceiving = false;
             m_Time->stop();
             return;
@@ -377,11 +485,13 @@ void FileSocket::onReadyRead()
 
         // 更新已处理字节数
         m_recvProcessedBytes += writeLen;
-        m_recvBuffer.clear(); // 清空缓冲区
 
         // 接收完成判断
         if (m_recvProcessedBytes >= m_recvTotalBytes)
         {
+            // CTR 收尾（正常情况下无残余，这里保证上下文被释放）
+            m_stream.finish();
+
             QString savePath = m_fileToRecv->fileName();
             // 清理资源
             m_fileToRecv->close();
@@ -395,6 +505,46 @@ void FileSocket::onReadyRead()
             qDebug() << "文件接收完成，保存路径：" << savePath;
         }
     }
+}
+
+/**
+ * @brief 用文件头里的 meta 解出本机的会话密钥
+ * meta 结构：{"v":1,"alg":"AES-256-CTR","eks":{"<uid>":"<base64 RSA-OAEP 包裹>"}}
+ * 每个接收者各有一份用自己公钥包裹的 key||iv，服务端解不开，只有对应私钥能取到。
+ */
+bool FileSocket::initRecvCrypto(const QByteArray &metaBytes)
+{
+    if (m_decryptPriv.isEmpty() || m_decryptUid <= 0)
+    {
+        emit sendFailed("该文件已端到端加密，但本机密钥未就绪，无法解密");
+        return false;
+    }
+
+    const QJsonObject meta = QJsonDocument::fromJson(metaBytes).object();
+    const QJsonObject eks = meta.value("eks").toObject();
+    const QString b64 = eks.value(QString::number(m_decryptUid)).toString();
+    if (b64.isEmpty())
+    {
+        emit sendFailed("该文件的会话密钥不包含本机份额，无法解密（可能不是发给你的文件）");
+        return false;
+    }
+
+    QByteArray keyIv;
+    if (!CryptoUtil::unwrap(m_decryptPriv, QByteArray::fromBase64(b64.toLatin1()), &keyIv)
+        || keyIv.size() != 48)
+    {
+        emit sendFailed(QString("文件会话密钥解封失败：%1").arg(CryptoUtil::lastError()));
+        return false;
+    }
+
+    if (!m_stream.initDecrypt(keyIv.left(32), keyIv.mid(32, 16)))
+    {
+        emit sendFailed(QString("初始化文件解密失败：%1").arg(CryptoUtil::lastError()));
+        return false;
+    }
+
+    qDebug() << "[加密] 已解出文件会话密钥，开始流式解密";
+    return true;
 }
 
 void FileSocket::requestFile(const QString &remoteFileName)
@@ -429,6 +579,9 @@ void FileSocket::resetSendState()
     m_recvTotalBytes = 0;
     m_recvProcessedBytes = 0;
     m_recvBuffer.clear();
+
+    // 释放加解密上下文（CTR 收尾无残余数据，这里只为释放资源）
+    m_stream.finish();
 
     // 重置状态标记
     m_isSending = false;

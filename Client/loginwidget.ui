@@ -188,11 +188,20 @@
           </property>
           <item>
            <widget class="QLabel" name="labelWeclcom">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>60</height>
+             </size>
+            </property>
             <property name="text">
              <string/>
-            </property>
-            <property name="pixmap">
-             <pixmap resource="images.qrc">:/resource/background/logo.jpg</pixmap>
             </property>
             <property name="alignment">
              <set>Qt::AlignCenter</set>
@@ -301,9 +310,6 @@
                      <width>16777215</width>
                      <height>25</height>
                     </size>
-                   </property>
-                   <property name="text">
-                    <string>111</string>
                    </property>
                    <property name="echoMode">
                     <enum>QLineEdit::Password</enum>

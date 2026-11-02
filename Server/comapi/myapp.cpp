@@ -7,6 +7,9 @@
 #include <QDir>
 #include <QProcess>
 #include <QDebug>
+#include <QFileInfo>
+#include <QImage>
+#include <QPainter>
 
 // 应用程序路径
 QString MyApp::m_strAppPath         = "./";
@@ -158,4 +161,61 @@ void MyApp::SaveConfig()
     settings.endGroup();
 
     settings.sync();
+}
+
+/**
+ * @brief MyApp::HeadFullPath
+ * 头像文件名 -> 服务器头像目录下的完整路径（兼容历史数据里存的完整路径）
+ */
+QString MyApp::HeadFullPath(const QString &head)
+{
+    QString name = QFileInfo(head).fileName();
+    if (name.isEmpty()) {
+        name = QStringLiteral("default.png");
+    }
+    return m_strHeadPath + name;
+}
+
+/**
+ * @brief MyApp::CreateDefaultHead
+ * 用代码画一张默认头像（蓝底 + 白色人形），不依赖资源文件
+ */
+bool MyApp::CreateDefaultHead(const QString &filePath)
+{
+    QImage img(96, 96, QImage::Format_ARGB32);
+    img.fill(Qt::transparent);
+
+    QPainter painter(&img);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+
+    // 圆角蓝底
+    painter.setBrush(QColor("#4A7ABB"));
+    painter.drawRoundedRect(0, 0, 96, 96, 18, 18);
+
+    // 头 + 肩膀
+    painter.setBrush(QColor(255, 255, 255, 235));
+    painter.drawEllipse(QPointF(48, 36), 15, 15);
+    painter.drawRoundedRect(QRectF(23, 57, 50, 40), 18, 18);
+    painter.end();
+
+    QDir().mkpath(QFileInfo(filePath).absolutePath());
+    return img.save(filePath, "PNG");
+}
+
+/**
+ * @brief MyApp::EnsureDefaultHead
+ * 服务器头像目录里必须有 default.png，缺失时自动生成一张
+ */
+QString MyApp::EnsureDefaultHead()
+{
+    const QString path = m_strHeadPath + QStringLiteral("default.png");
+    if (!QFile::exists(path)) {
+        if (CreateDefaultHead(path)) {
+            qInfo() << "[头像] 已生成默认头像：" << path;
+        } else {
+            qWarning() << "[头像] 默认头像生成失败：" << path;
+        }
+    }
+    return path;
 }

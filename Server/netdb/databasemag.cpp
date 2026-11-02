@@ -3,7 +3,13 @@
 #include <QJsonObject>
 #include <QSqlQuery>
 #include "comapi/myapp.h"
+#include "comapi/cryptoutil.h"
+#include "passwordhash.h"
 #include <QSqlError>
+#include <QSet>
+#include <QStringList>
+#include <QPair>
+#include <QVariant>
 
 DataBaseMag *DataBaseMag::self = nullptr;
 
@@ -41,6 +47,12 @@ bool DataBaseMag::openDatabase(const QString &dataName)
 
     createDatabase();
 
+    // 老版本数据库缺列时自动补齐（电话 / 工作组 / 邮箱）
+    ensureUserInfoColumns();
+
+    // 历史遗留的明文口令统一转成加盐哈希（只跑一次，之后没有明文可迁）
+    migratePlainPasswords();
+
     qDebug() << "数据库打开成功：" << dataName;
     return true;
 }
@@ -61,8 +73,12 @@ void DataBaseMag::createDatabase()
     sql = QString("CREATE TABLE IF NOT EXISTS USERINFO (");
     sql.append(QString("id INTEGER PRIMARY KEY AUTOINCREMENT,"));
     sql.append(QString("name VARCHAR(30) NOT NULL UNIQUE,"));
-    sql.append(QString("passwd VARCHAR(30) NOT NULL,"));
+    sql.append(QString("passwd VARCHAR(200) NOT NULL,"));   // 存 PBKDF2 哈希串，不是明文
     sql.append(QString("head VARCHAR(100) DEFAULT 'default.png',"));
+    sql.append(QString("phone VARCHAR(30) DEFAULT '',"));
+    sql.append(QString("work_group VARCHAR(50) DEFAULT '',"));
+    sql.append(QString("email VARCHAR(60) DEFAULT '',"));
+    sql.append(QString("pub_key TEXT DEFAULT '',"));        // 用户公钥 PEM（公开信息，供他人加密）
     sql.append(QString("status INTEGER DEFAULT %1,").arg(OffLine));
     sql.append(QString("lasttime DATETIME DEFAULT NULL);"));
     query.exec(sql);
@@ -98,8 +114,12 @@ void DataBaseMag::createDatabase()
     sql.append(QString("UNIQUE (user_id, friend_id));"));
     query.exec(sql);
 
-    sql = QString("INSERT INTO USERINFO VALUES(1, 'admin', '123456', '2.bmp', %1, '');").arg(OffLine);    //插入数据
-    query.exec(sql);
+    // 显式列名，避免后续给 USERINFO 加列后这里因列数不匹配而失败
+    sql = QString("INSERT INTO USERINFO (id, name, passwd, head, status, lasttime) "
+                  "VALUES(1, 'admin', ?, '2.bmp', %1, '');").arg(OffLine);    //插入数据
+    query.prepare(sql);
+    query.addBindValue(PasswordHash::make(QStringLiteral("123456")));   // 只存哈希，不落明文
+    query.exec();   // 主键冲突时失败属正常（只有首次建库会真正插入）
 
     //消息队列数据库
     sql = QString ("CREATE TABLE IF NOT EXISTS MESSAGEQUEUE (");
@@ -111,6 +131,114 @@ void DataBaseMag::createDatabase()
     sql.append(QString("message_type INTEGER NOT NULL);"));
 
     query.exec(sql);
+
+    // 消息审计日志：端到端加密下服务器只存密文原文
+    sql = QString("CREATE TABLE IF NOT EXISTS MSGLOG (");
+    sql.append(QString("id INTEGER PRIMARY KEY AUTOINCREMENT,"));
+    sql.append(QString("send_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"));
+    sql.append(QString("from_id INTEGER NOT NULL,"));
+    sql.append(QString("to_id INTEGER NOT NULL,"));          // 私聊=接收者ID，群聊=群ID
+    sql.append(QString("is_group INTEGER NOT NULL DEFAULT 0,"));
+    sql.append(QString("msg_type INTEGER NOT NULL DEFAULT 0,"));
+    sql.append(QString("payload TEXT NOT NULL);"));          // 消息 JSON 原样（密文字段不被改动）
+    query.exec(sql);
+    query.exec("CREATE INDEX IF NOT EXISTS idx_msglog_time ON MSGLOG(send_time);");
+
+    // 说明：服务器不保存任何私钥，因此没有 SYSKEY 之类的密钥表。
+    // 端到端加密要求服务器"零知识"：它只转发密文，永远不持有能解开正文的材料。
+}
+
+/**
+ * @brief DataBaseMag::ensureUserInfoColumns
+ * 老版本数据库的 USERINFO 表只有 id/name/passwd/head/status/lasttime，
+ * 这里检查并补齐服务器管理界面用到的 phone / work_group / email 三列。
+ */
+void DataBaseMag::ensureUserInfoColumns()
+{
+    QSqlQuery query(userdb);
+    QSet<QString> columns;
+    if (query.exec("PRAGMA table_info(USERINFO);")) {
+        while (query.next()) {
+            columns.insert(query.value("name").toString().toLower());
+        }
+    }
+
+    if (!columns.contains("phone")) {
+        if (query.exec("ALTER TABLE USERINFO ADD COLUMN phone VARCHAR(30) DEFAULT '';")) {
+            qInfo() << "[数据库] USERINFO 补充 phone 列";
+        } else {
+            qWarning() << "[数据库] 补充 phone 列失败：" << query.lastError().text();
+        }
+    }
+    if (!columns.contains("work_group")) {
+        if (query.exec("ALTER TABLE USERINFO ADD COLUMN work_group VARCHAR(50) DEFAULT '';")) {
+            qInfo() << "[数据库] USERINFO 补充 work_group 列";
+        } else {
+            qWarning() << "[数据库] 补充 work_group 列失败：" << query.lastError().text();
+        }
+    }
+    if (!columns.contains("email")) {
+        if (query.exec("ALTER TABLE USERINFO ADD COLUMN email VARCHAR(60) DEFAULT '';")) {
+            qInfo() << "[数据库] USERINFO 补充 email 列";
+        } else {
+            qWarning() << "[数据库] 补充 email 列失败：" << query.lastError().text();
+        }
+    }
+    if (!columns.contains("pub_key")) {
+        if (query.exec("ALTER TABLE USERINFO ADD COLUMN pub_key TEXT DEFAULT '';")) {
+            qInfo() << "[数据库] USERINFO 补充 pub_key 列";
+        } else {
+            qWarning() << "[数据库] 补充 pub_key 列失败：" << query.lastError().text();
+        }
+    }
+}
+
+/**
+ * @brief DataBaseMag::migratePlainPasswords
+ * 把历史遗留的明文口令就地转成 PBKDF2 加盐哈希。
+ *
+ * 老库（含早期注册的用户、内置 admin）存的是明文，直接换成哈希会导致
+ * 这些账号无法登录，所以启动时自动迁移一次：逐个取出来算哈希再写回。
+ * 密码本身不变，用户无感知。
+ */
+int DataBaseMag::migratePlainPasswords()
+{
+    if (!userdb.isOpen()) return 0;
+
+    QList<QPair<int, QString>> plainList;   // id → 明文口令
+    QSqlQuery query(userdb);
+    if (!query.exec("SELECT id, passwd FROM USERINFO;")) {
+        qDebug() << "[密码] 读取用户表失败：" << query.lastError().text();
+        return 0;
+    }
+    while (query.next()) {
+        const QString pwd = query.value("passwd").toString();
+        if (!pwd.isEmpty() && !PasswordHash::isHashed(pwd)) {
+            plainList.append(qMakePair(query.value("id").toInt(), pwd));
+        }
+    }
+    if (plainList.isEmpty()) return 0;
+
+    QSqlQuery update(userdb);
+    update.prepare("UPDATE USERINFO SET passwd = :passwd WHERE id = :id;");
+
+    int done = 0;
+    for (const QPair<int, QString> &item : plainList) {
+        const QString hashed = PasswordHash::make(item.second);
+        if (hashed.isEmpty()) continue;
+
+        update.bindValue(":passwd", hashed);
+        update.bindValue(":id", item.first);
+        if (update.exec()) {
+            ++done;
+        } else {
+            qWarning() << "[密码] 迁移失败 id =" << item.first
+                       << update.lastError().text();
+        }
+    }
+
+    qInfo() << "[密码] 明文口令已迁移为 PBKDF2-SHA256 哈希，共" << done << "条";
+    return done;
 }
 
 void DataBaseMag::changeAllUserStatus()
@@ -129,7 +257,7 @@ E_STATUS DataBaseMag::userRegister(const QString &name, const QString &passwd)
     QString sql("INSERT INTO USERINFO (name, passwd) VALUES (?, ?)");
     query.prepare(sql);
     query.addBindValue(name);
-    query.addBindValue(passwd);
+    query.addBindValue(PasswordHash::make(passwd));   // 入库即哈希
     return query.exec() ? RegisterOk : RegisterFailed;
 }
 
@@ -141,17 +269,21 @@ QJsonObject DataBaseMag::userLogin(const QString &name, const QString &passwd)
     QString strHead = "0.bmp";
 
     QSqlQuery query;
-    const QString sql = "SELECT id, head, status FROM USERINFO WHERE name = ? AND passwd = ?";
+    // 密码是加盐哈希，没法再用 WHERE passwd = ? 比较，只能取出来本地校验
+    const QString sql = "SELECT id, head, status, passwd FROM USERINFO WHERE name = ?";
 
     query.prepare(sql);
     query.addBindValue(name);
-    query.addBindValue(passwd);
 
-    if (query.exec() && query.next()) {
+    if (query.exec() && query.next()
+            && PasswordHash::verify(passwd, query.value("passwd").toString())) {
         nId = query.value("id").toInt();
         int nStatus = query.value("status").toInt();
         if (OnLine == nStatus)
         {
+            // 数据库里记的是在线，但真实情况要以连接表为准，
+            // 这里把真实 id 一并带出去，让上层判断是不是脏数据
+            jsonObj.insert("realId", nId);
             nId = -2;
             code = -2;
         }
@@ -196,6 +328,28 @@ bool DataBaseMag::isFriend(const int &userId, const QString &friendName)
 
 }
 
+/**
+ * @brief DataBaseMag::updateUserHead
+ * 更新用户头像文件名（只存文件名，不存完整路径）
+ */
+bool DataBaseMag::updateUserHead(const int &userId, const QString &head)
+{
+    if (userId < 0 || head.isEmpty()) {
+        qDebug() << "[头像] 更新失败，参数不合法 userId =" << userId << " head =" << head;
+        return false;
+    }
+
+    QSqlQuery query;
+    query.prepare("UPDATE USERINFO SET head = :head WHERE id = :userId;");
+    query.bindValue(":head", head);
+    query.bindValue(":userId", userId);
+    if (!query.exec()) {
+        qDebug() << "[头像] 更新数据库失败" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
 QString DataBaseMag::getUserHead(const int &userId)
 {
     QSqlQuery query;
@@ -214,6 +368,232 @@ QString DataBaseMag::getUserHead(const int &userId)
     return query.value("head").toString();
 }
 
+/**
+ * @brief DataBaseMag::insertUser
+ * 服务器管理界面添加用户（带电话 / 工作组 / 邮箱 / 头像），返回新用户ID，失败返回 -1
+ */
+int DataBaseMag::insertUser(const QString &name, const QString &passwd,
+                            const QString &phone, const QString &workGroup,
+                            const QString &email, const QString &head, QString *err)
+{
+    auto fail = [err](const QString &msg) {
+        if (err) *err = msg;
+        return -1;
+    };
+    const QString userName = name.trimmed();
+    if (userName.isEmpty()) return fail("用户名不能为空");
+    if (passwd.isEmpty())    return fail("密码不能为空");
+    if (haveUser(userName))  return fail("用户名已存在");
+
+    QSqlQuery query(userdb);
+    query.prepare("INSERT INTO USERINFO (name, passwd, phone, work_group, email, head, status) "
+                  "VALUES (:name, :passwd, :phone, :wg, :email, :head, :status);");
+    query.bindValue(":name", userName);
+    query.bindValue(":passwd", PasswordHash::make(passwd));   // 只存哈希
+    query.bindValue(":phone", phone);
+    query.bindValue(":wg", workGroup);
+    query.bindValue(":email", email);
+    query.bindValue(":head", head.isEmpty() ? QStringLiteral("default.png") : head);
+    query.bindValue(":status", static_cast<int>(OffLine));
+    if (!query.exec()) {
+        qDebug() << "[用户] 添加失败：" << query.lastError().text();
+        return fail(query.lastError().text());
+    }
+
+    int newId = query.lastInsertId().toInt();
+    qInfo() << "[用户] 添加成功：" << userName << " id =" << newId;
+    return newId;
+}
+
+/**
+ * @brief DataBaseMag::updateUserInfo
+ * 修改用户资料；head 为空表示不修改头像
+ */
+bool DataBaseMag::updateUserInfo(int id, const QString &name, const QString &passwd,
+                                 const QString &phone, const QString &workGroup,
+                                 const QString &email, const QString &head, QString *err)
+{
+    auto fail = [err](const QString &msg) {
+        if (err) *err = msg;
+        return false;
+    };
+    if (id <= 0) return fail("请先选择一个用户");
+    const QString userName = name.trimmed();
+    if (userName.isEmpty()) return fail("用户名不能为空");
+
+    QSqlQuery dup(userdb);
+    dup.prepare("SELECT id FROM USERINFO WHERE name = :name AND id <> :id;");
+    dup.bindValue(":name", userName);
+    dup.bindValue(":id", id);
+    if (dup.exec() && dup.next()) return fail("用户名已被其它用户占用");
+
+    // 密码列存的是哈希，界面无法回填原密码，因此"留空"表示保持原密码不变
+    QStringList sets;
+    sets << "name = :name" << "phone = :phone"
+         << "work_group = :wg" << "email = :email";
+    if (!head.isEmpty())     sets << "head = :head";
+    if (!passwd.isEmpty())   sets << "passwd = :passwd";
+
+    QSqlQuery query(userdb);
+    query.prepare(QString("UPDATE USERINFO SET %1 WHERE id = :id;").arg(sets.join(", ")));
+    if (!head.isEmpty())     query.bindValue(":head", head);
+    if (!passwd.isEmpty())   query.bindValue(":passwd", PasswordHash::make(passwd));
+    query.bindValue(":name", userName);
+    query.bindValue(":phone", phone);
+    query.bindValue(":wg", workGroup);
+    query.bindValue(":email", email);
+    query.bindValue(":id", id);
+    if (!query.exec()) {
+        qDebug() << "[用户] 修改失败：" << query.lastError().text();
+        return fail(query.lastError().text());
+    }
+    qInfo() << "[用户] 修改成功：id =" << id << " name =" << userName;
+    return true;
+}
+
+/**
+ * @brief DataBaseMag::deleteUser
+ * 删除用户，好友关系与群成员记录由外键级联删除
+ */
+bool DataBaseMag::deleteUser(int id, QString *err)
+{
+    auto fail = [err](const QString &msg) {
+        if (err) *err = msg;
+        return false;
+    };
+    if (id <= 0) return fail("请先选择一个用户");
+    if (id == 1) return fail("内置管理员 admin 不允许删除");
+
+    QSqlQuery query(userdb);
+    query.prepare("DELETE FROM USERINFO WHERE id = :id;");
+    query.bindValue(":id", id);
+    if (!query.exec()) {
+        qDebug() << "[用户] 删除失败：" << query.lastError().text();
+        return fail(query.lastError().text());
+    }
+    if (query.numRowsAffected() <= 0) return fail("该用户不存在或已被删除");
+    qInfo() << "[用户] 已删除：id =" << id;
+    return true;
+}
+
+/**
+ * @brief DataBaseMag::checkPassword
+ * 只校验密码，不修改在线状态（区别于 userLogin）
+ */
+bool DataBaseMag::checkPassword(const QString &name, const QString &passwd)
+{
+    if (name.isEmpty() || passwd.isEmpty()) return false;
+    QSqlQuery query(userdb);
+    query.prepare("SELECT passwd FROM USERINFO WHERE name = :name LIMIT 1;");
+    query.bindValue(":name", name);
+    if (!query.exec() || !query.next()) return false;
+    return PasswordHash::verify(passwd, query.value("passwd").toString());
+}
+
+bool DataBaseMag::updatePassword(const QString &name, const QString &newPasswd)
+{
+    if (name.isEmpty() || newPasswd.isEmpty()) return false;
+    QSqlQuery query(userdb);
+    query.prepare("UPDATE USERINFO SET passwd = :passwd WHERE name = :name;");
+    query.bindValue(":passwd", PasswordHash::make(newPasswd));
+    query.bindValue(":name", name);
+    if (!query.exec()) {
+        qDebug() << "[密码] 修改失败：" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+/**
+ * @brief DataBaseMag::getUserInfoByName
+ * 按用户名（支持模糊）或纯数字ID查询单个用户详情，未找到返回空 map
+ */
+QVariantMap DataBaseMag::getUserInfoByName(const QString &key)
+{
+    QVariantMap map;
+    const QString k = key.trimmed();
+    if (k.isEmpty() || !userdb.isOpen()) return map;
+
+    QSqlQuery query(userdb);
+    bool isId = false;
+    const int id = k.toInt(&isId);
+    if (isId) {
+        query.prepare("SELECT * FROM USERINFO WHERE id = :v LIMIT 1;");
+        query.bindValue(":v", id);
+    } else {
+        query.prepare("SELECT * FROM USERINFO WHERE name = :v OR name LIKE :like "
+                      "ORDER BY (name = :v) DESC LIMIT 1;");
+        query.bindValue(":v", k);
+        query.bindValue(":like", "%" + k + "%");
+    }
+    if (!query.exec()) {
+        qDebug() << "[用户] 查询失败：" << query.lastError().text();
+        return map;
+    }
+    if (!query.next()) return map;
+
+    map["id"]         = query.value("id").toInt();
+    map["name"]       = query.value("name").toString();
+    map["passwd"]     = QString();   // 只存哈希，不回传（界面留空=不修改）
+    map["head"]       = query.value("head").toString();
+    map["phone"]      = query.value("phone").toString();
+    map["work_group"] = query.value("work_group").toString();
+    map["email"]      = query.value("email").toString();
+    map["status"]     = query.value("status").toInt();
+    map["lasttime"]   = query.value("lasttime").toString();
+    return map;
+}
+
+QVariantMap DataBaseMag::getUserInfoById(int id)
+{
+    if (id <= 0) return QVariantMap();
+    return getUserInfoByName(QString::number(id));
+}
+
+int DataBaseMag::getUserCount()
+{
+    QSqlQuery query(userdb);
+    if (query.exec("SELECT COUNT(*) FROM USERINFO;") && query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
+int DataBaseMag::getOnlineUserCount()
+{
+    QSqlQuery query(userdb);
+    query.prepare("SELECT COUNT(*) FROM USERINFO WHERE status = :status;");
+    query.bindValue(":status", static_cast<int>(OnLine));
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
+int DataBaseMag::getFriendCount(int userId)
+{
+    if (userId <= 0) return 0;
+    QSqlQuery query(userdb);
+    query.prepare("SELECT COUNT(*) FROM FRIEND WHERE user_id = :id;");
+    query.bindValue(":id", userId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
+int DataBaseMag::getGroupCount(int userId)
+{
+    if (userId <= 0) return 0;
+    QSqlQuery query(userdb);
+    query.prepare("SELECT COUNT(*) FROM GROUP_MEMBER WHERE user_id = :id;");
+    query.bindValue(":id", userId);
+    if (query.exec() && query.next()) {
+        return query.value(0).toInt();
+    }
+    return 0;
+}
+
 bool DataBaseMag::haveUser(const QString &name)
 {
     if(name.isEmpty()){
@@ -230,12 +610,14 @@ bool DataBaseMag::haveUser(const QString &name)
     return query.next();
 }
 
-void DataBaseMag::UpdateUserStatus(int id, E_STATUS status)
+void DataBaseMag::UpdateUserStatus(int id, E_STATUS status, bool touchTime)
 {
     if (id <= 0) return;
 
     QSqlQuery query;
-    const QString sql = "UPDATE USERINFO SET status = ?, lasttime = datetime('now') WHERE id = ?";
+    const QString sql = touchTime
+            ? QString("UPDATE USERINFO SET status = ?, lasttime = datetime('now') WHERE id = ?")
+            : QString("UPDATE USERINFO SET status = ? WHERE id = ?");
     query.prepare(sql);
     query.addBindValue(static_cast<int>(status));
     query.addBindValue(id);
@@ -259,8 +641,11 @@ QList<QVariantMap> DataBaseMag::getAllUser()
             // 按字段名取值，键名和数据库字段一致，便于后续使用
             userMap["id"] = query.value("id").toInt();
             userMap["name"] = query.value("name").toString();
-            userMap["passwd"] = query.value("passwd").toString();
+            userMap["passwd"] = QString();   // 密码哈希不外泄到界面
             userMap["head"] = query.value("head").toString();
+            userMap["phone"] = query.value("phone").toString();
+            userMap["work_group"] = query.value("work_group").toString();
+            userMap["email"] = query.value("email").toString();
             userMap["status"] = query.value("status").toInt();
             userMap["lasttime"] = query.value("lasttime").toString();
 
@@ -554,6 +939,49 @@ bool DataBaseMag::addGroupMember(const int &userId, const int &groupId, GroupIde
     return true;
 }
 
+/**
+ * @brief DataBaseMag::removeGroupMember
+ * 退出群组：把某个成员从群里删掉
+ */
+bool DataBaseMag::removeGroupMember(const int &groupId, const int &userId)
+{
+    if (groupId < 0 || userId < 0) return false;
+    QSqlQuery query;
+    query.prepare("DELETE FROM GROUP_MEMBER WHERE group_id = :groupId AND user_id = :userId;");
+    query.bindValue(":groupId", groupId);
+    query.bindValue(":userId", userId);
+    if (!query.exec()) {
+        qDebug() << "删除群成员失败" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief DataBaseMag::removeGroup
+ * 解散群组：删除群以及它的所有成员记录
+ */
+bool DataBaseMag::removeGroup(const int &groupId)
+{
+    if (groupId < 0) return false;
+
+    QSqlQuery query;
+    query.prepare("DELETE FROM GROUP_MEMBER WHERE group_id = :groupId;");
+    query.bindValue(":groupId", groupId);
+    if (!query.exec()) {
+        qDebug() << "删除群成员记录失败" << query.lastError();
+        return false;
+    }
+
+    query.prepare("DELETE FROM GROUPS WHERE group_id = :groupId;");
+    query.bindValue(":groupId", groupId);
+    if (!query.exec()) {
+        qDebug() << "删除群组失败" << query.lastError();
+        return false;
+    }
+    return true;
+}
+
 int DataBaseMag::getGroupOwner(const int &groupId)
 {
     QSqlQuery query;
@@ -614,6 +1042,94 @@ QHash<int, QSet<int> > DataBaseMag::initGroupMembersCache()
     return hashSet;
 }
 
+/**
+ * @brief DataBaseMag::getGroupMemberDetail
+ * 群成员详情：昵称、头像、角色、是否在线、入群时间。
+ * 客户端"群成员"面板直接用这个数组渲染。
+ */
+QJsonValue DataBaseMag::getGroupMemberDetail(const int &groupId)
+{
+    QJsonArray jsonArr;
+
+    QSqlQuery query(userdb);
+    const QString sql =
+            "SELECT gm.user_id, gm.identity, gm.join_time, "
+            "       u.name, u.head, u.status "
+            "FROM GROUP_MEMBER gm LEFT JOIN USERINFO u ON gm.user_id = u.id "
+            "WHERE gm.group_id = :groupId "
+            "ORDER BY gm.identity DESC, gm.join_time ASC;";
+    query.prepare(sql);
+    query.bindValue(":groupId", groupId);
+    if (!query.exec()) {
+        qDebug() << "[群成员] 查询失败：" << query.lastError().text();
+        return QJsonValue(jsonArr);
+    }
+
+    while (query.next()) {
+        QJsonObject obj;
+        obj.insert("groupId", groupId);
+        obj.insert("userId",  query.value("user_id").toInt());
+        obj.insert("identity", query.value("identity").toInt());
+        obj.insert("joinTime", query.value("join_time").toString());
+        obj.insert("name",    query.value("name").toString());
+        obj.insert("head",    query.value("head").toString());
+        obj.insert("online",  query.value("status").toInt() == OnLine);
+        jsonArr.append(obj);
+    }
+    return QJsonValue(jsonArr);
+}
+
+/**
+ * @brief DataBaseMag::isGroupOwner
+ * 群主判定以 GROUPS.creator_id 为准（identity 字段老数据可能没同步）
+ */
+bool DataBaseMag::isGroupOwner(const int &groupId, const int &userId)
+{
+    if (groupId <= 0 || userId <= 0) return false;
+
+    QSqlQuery query(userdb);
+    query.prepare("SELECT creator_id FROM GROUPS WHERE group_id = :gid LIMIT 1;");
+    query.bindValue(":gid", groupId);
+    if (query.exec() && query.next() && query.value("creator_id").toInt() == userId) {
+        return true;
+    }
+
+    // 兜底：creator_id 没维护时看 GROUP_MEMBER.identity
+    QSqlQuery q2(userdb);
+    q2.prepare("SELECT identity FROM GROUP_MEMBER WHERE group_id = :gid AND user_id = :uid LIMIT 1;");
+    q2.bindValue(":gid", groupId);
+    q2.bindValue(":uid", userId);
+    return q2.exec() && q2.next() && q2.value("identity").toInt() == Owner;
+}
+
+bool DataBaseMag::setGroupMemberIdentity(const int &groupId, const int &userId, const int &identity)
+{
+    QSqlQuery query(userdb);
+    query.prepare("UPDATE GROUP_MEMBER SET identity = :identity "
+                  "WHERE group_id = :gid AND user_id = :uid;");
+    query.bindValue(":identity", identity);
+    query.bindValue(":gid", groupId);
+    query.bindValue(":uid", userId);
+    if (!query.exec()) {
+        qDebug() << "[群成员] 更新角色失败：" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+bool DataBaseMag::setGroupCreator(const int &groupId, const int &userId)
+{
+    QSqlQuery query(userdb);
+    query.prepare("UPDATE GROUPS SET creator_id = :uid WHERE group_id = :gid;");
+    query.bindValue(":uid", userId);
+    query.bindValue(":gid", groupId);
+    if (!query.exec()) {
+        qDebug() << "[群成员] 更新群主失败：" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
 QJsonValue DataBaseMag::getGroupMember(const int &groupId)
 {
     QJsonArray jsonArr;
@@ -640,4 +1156,94 @@ QJsonValue DataBaseMag::getGroupMember(const int &groupId)
 void DataBaseMag::queryAll()
 {
 
+}
+
+// ==================================================================
+// 端到端加密：用户公钥目录
+// ==================================================================
+/**
+ * @brief 保存用户公钥
+ *
+ * 服务器只保存公钥这种本来就公开的材料。用户私钥永远只留在各自的机器上，
+ * 服务器既没有托管副本，也没有管理员私钥，所以它在数学上无法解密任何正文。
+ */
+bool DataBaseMag::updateUserKeys(int id, const QString &pubKey)
+{
+    QSqlQuery query(userdb);
+    query.prepare("UPDATE USERINFO SET pub_key = ? WHERE id = ?");
+    query.addBindValue(pubKey);
+    query.addBindValue(id);
+    if (!query.exec()) {
+        qWarning() << "[加密] 保存用户公钥失败：" << query.lastError().text();
+        return false;
+    }
+    return query.numRowsAffected() > 0;
+}
+
+QString DataBaseMag::getUserPubKey(int id)
+{
+    QSqlQuery query(userdb);
+    query.prepare("SELECT pub_key FROM USERINFO WHERE id = ?");
+    query.addBindValue(id);
+    if (query.exec() && query.next()) return query.value(0).toString();
+    return QString();
+}
+
+// ==================================================================
+// 端到端加密：消息审计
+// ==================================================================
+void DataBaseMag::insertMsgLog(int fromId, int toId, bool isGroup, quint8 type, const QString &payload)
+{
+    QSqlQuery query(userdb);
+    query.prepare("INSERT INTO MSGLOG (from_id, to_id, is_group, msg_type, payload) "
+                  "VALUES (?, ?, ?, ?, ?)");
+    query.addBindValue(fromId);
+    query.addBindValue(toId);
+    query.addBindValue(isGroup ? 1 : 0);
+    query.addBindValue(static_cast<int>(type));
+    query.addBindValue(payload);
+    if (!query.exec()) {
+        qWarning() << "[审计] 写入消息日志失败：" << query.lastError().text();
+    }
+}
+
+QList<QVariantMap> DataBaseMag::getMsgLog(int limit)
+{
+    QList<QVariantMap> list;
+    QSqlQuery query(userdb);
+    query.prepare("SELECT m.id, m.send_time, m.from_id, m.to_id, m.is_group, m.msg_type, m.payload,"
+                  "       uf.name AS from_name"
+                  "  FROM MSGLOG m LEFT JOIN USERINFO uf ON uf.id = m.from_id"
+                  " ORDER BY m.id DESC LIMIT ?");
+    query.addBindValue(limit);
+    if (!query.exec()) {
+        qWarning() << "[审计] 读取消息日志失败：" << query.lastError().text();
+        return list;
+    }
+    while (query.next()) {
+        QVariantMap row;
+        row.insert("id", query.value("id").toInt());
+        row.insert("time", query.value("send_time").toString());
+        row.insert("fromId", query.value("from_id").toInt());
+        row.insert("toId", query.value("to_id").toInt());
+        row.insert("isGroup", query.value("is_group").toInt() != 0);
+        row.insert("type", query.value("msg_type").toInt());
+        row.insert("payload", query.value("payload").toString());
+        row.insert("fromName", query.value("from_name").toString());
+        if (row.value("isGroup").toBool()) {
+            row.insert("toName", getGroupName(query.value("to_id").toInt()));
+        } else {
+            row.insert("toName", getUsernameFromId(QString::number(query.value("to_id").toInt())));
+        }
+        list.append(row);
+    }
+    return list;
+}
+
+int DataBaseMag::getMsgLogCount()
+{
+    QSqlQuery query(userdb);
+    if (query.exec("SELECT COUNT(*) FROM MSGLOG") && query.next())
+        return query.value(0).toInt();
+    return 0;
 }

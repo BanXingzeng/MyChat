@@ -46,6 +46,13 @@ public:
     static void CheckDirs();
 
     static void SaveConfig();
+
+    /// 头像文件名（或历史遗留的完整路径）转成本地完整路径，空值回退 default.png
+    static QString HeadFullPath(const QString &head);
+    /// 确保服务器头像目录里有 default.png（没有就用代码画一张），返回其完整路径
+    static QString EnsureDefaultHead();
+    /// 生成默认头像并保存到指定路径（96x96 PNG）
+    static bool CreateDefaultHead(const QString &filePath);
 };
 
 #endif // MYAPP_H

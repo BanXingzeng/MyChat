@@ -118,6 +118,13 @@ typedef enum {
     Face,           //动画表情
 } MessageType;
 
+// 自己发出的消息的送达状态（气泡左下角的小图标）
+typedef enum {
+    SendSending,    // 已发出，等服务端回执
+    SendDone,       // 服务端已受理
+    SendFailed,     // 超时 / 断线，右键可重新发送
+} SendState;
+
 
 typedef enum {
     Unknow,
@@ -163,6 +170,18 @@ typedef enum {
 
     GetFile             = 0x65,     // 获取文件（到服务器下载文件）
     GetPicture,                     // 图片下载
+    GetUserHead         = 0x67,     // 获取用户头像（本地缺文件时向服务器拉取）
+
+    // ===== 端到端加密：密钥交换 =====
+    GetPubKey           = 0x68,     // 客户端 → 服务端：请求指定用户的公钥
+    UploadKeys          = 0x69,     // 客户端 → 服务端：登记本人公钥（只传公钥，私钥永不外发）
+    HeartBeat           = 0x6A,     // 客户端 → 服务端：心跳（用于判定真实在线状态）
+    RecallMsg           = 0x6B,     // 撤回消息（携带 msg_key，服务端只做转发）
+
+    // ===== 群成员管理 =====
+    GetGroupMembers     = 0x6C,     // 客户端 → 服务端：请求群成员列表
+    KickGroupMember     = 0x6D,     // 客户端 → 服务端：群主把某人移出群聊
+    TransferGroupOwner  = 0x6E,     // 客户端 → 服务端：群主转让群主身份
 
 } E_MSG_TYPE;
 
@@ -182,6 +201,40 @@ typedef enum {
     AddFriendFailed_NoneUser,   //用户不存在
     AddFriendFailed_IsHad,  //已经有好友了状态为1
     AddFriendFailed_Readd,  //重复添加状态为0(申请还未同意/拒绝)
+
+    // 群组管理
+    QuitGroup,              // 客户端 → 服务端：退出群组
+    QuitGroupOk,            // 服务端 → 客户端：退群成功
+    DissolveGroup,          // 客户端 → 服务端：解散群组（仅群主）
+    DissolveGroupOk,        // 服务端 → 客户端：解散成功（群主）
+    GroupDissolved,         // 服务端 → 客户端：群已解散（通知其它成员）
+    GroupOperateFailed,     // 服务端 → 客户端：群操作失败
+
+    // 头像
+    UpdateHeadOk        = 0x70,     // 服务端 → 客户端：自己的头像更新成功
+    HeadChanged         = 0x71,     // 服务端 → 客户端：某个用户换了头像
+    HeadData            = 0x72,     // 服务端 → 客户端：头像图片内容（base64）
+    HeadOperateFailed   = 0x73,     // 服务端 → 客户端：头像操作失败
+    ChangePasswdOk      = 0x74,     // 服务端 → 客户端：密码修改成功
+    ChangePasswdFailed  = 0x75,     // 服务端 → 客户端：密码修改失败
+
+    // ===== 端到端加密：公钥交换 =====
+    // 注意：0x76 原为 AdminPubKey（管理员公钥下发），端到端改造后服务器不持有任何私钥，
+    // 该报文已彻底移除，编号有意留空不再复用，避免与历史日志混淆。
+    UploadKeysOk        = 0x77,     // 服务端 → 客户端：公钥上传成功
+    PubKeyData          = 0x78,     // 服务端 → 客户端：用户公钥列表
+    KeyOperateFailed    = 0x79,     // 服务端 → 客户端：密钥操作失败
+    HeartBeatAck        = 0x7A,     // 服务端 → 客户端：心跳应答
+
+    // ===== 群成员管理 =====
+    GroupMembers        = 0x7B,     // 服务端 → 客户端：群成员列表
+    GroupMemberChanged  = 0x7C,     // 服务端 → 客户端：群成员有变动（踢人/退群/转让）
+    GroupKicked         = 0x7D,     // 服务端 → 客户端：你已被移出该群
+
+    // ===== 发送回执 =====
+    // 服务端收到并受理一条消息后，把消息里的 key 原样回给发送者。
+    // 客户端据此把气泡置为"已送达"，超时没收到回执就标红提示可重发。
+    SendAck             = 0x7E,
 } E_STATUS;
 
 #endif // UNIT

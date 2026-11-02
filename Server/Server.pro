@@ -11,6 +11,9 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 TARGET = Server
 TEMPLATE = app
 
+# Windows 可执行文件图标（qmake 会自动生成 .rc 并用 windres 编译）
+win32: RC_ICONS = $$PWD/resource/ico/app.ico
+
 # The following define makes your compiler emit warnings if you use
 # any feature of Qt which has been marked as deprecated (the exact warnings
 # depend on your compiler). Please consult the documentation of the
@@ -42,6 +45,9 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 include(comapi/comapi.pri)
 include(basewidget/basewidget.pri)
 include(netdb/netdb.pri)
+
+# OpenSSL 4.1.0 (Win32) —— 消息端到端加密 / 管理员密钥托管
+include($$PWD/../3rdparty/openssl32/openssl.pri)
 
 RESOURCES += \
     images.qrc
