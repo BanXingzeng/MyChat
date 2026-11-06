@@ -130,15 +130,17 @@ MainWindow::MainWindow(MySocket *socket, QWidget *parent) :
     connect(ui->convationListWidget, SIGNAL(onChildDidDoubleClicked(QQCell*)),
             this, SLOT(SltConversationClicked(QQCell*)));
 
-    // 登录后先把上次没读的消息统计出来（离线期间的未读保存在消息库里）
-    refreshConversationList();
-    refreshUnreadBadges();
-
     // 会话页右键：删除会话（只删聊天记录，不删好友）
+    // 必须先建菜单再刷新列表：refreshConversationList() 里会立刻创建子项控件，
+    // 那时菜单还没设置，右键拿到的就是空指针。
     QMenu *convMenu = new QMenu(this);
     convMenu->addAction(tr("删除会话"));
     ui->convationListWidget->setChildPopMenu(convMenu);
     connect(convMenu, &QMenu::triggered, this, &MainWindow::onConvMenuSelected);
+
+    // 登录后先把上次没读的消息统计出来（离线期间的未读保存在消息库里）
+    refreshConversationList();
+    refreshUnreadBadges();
 
     // 申请列表页（好友申请 / 加群申请），挂在堆叠页最后
     m_requestPage = new QWidget(ui->GCStackedWidget);
@@ -1046,10 +1048,8 @@ void MainWindow::sltRelogin()
     if (!m_tcpSocket || !m_tcpSocket->isConnected()) return;
     if (MyApp::m_strUserName.isEmpty() || MyApp::m_strPassword.isEmpty()) return;
 
-    QJsonObject json;
-    json.insert("name", MyApp::m_strUserName);
-    json.insert("passwd", MyApp::m_strPassword);
-    m_tcpSocket->sendMessage(Login, QJsonValue(json));
+    // 协议 v2：挑战-应答，只发用户名，口令留在本机算证明
+    m_tcpSocket->sendLogin(MyApp::m_strUserName, MyApp::m_strPassword);
 
     qInfo() << "[重连] 正在重新登录（第" << (m_nReloginTries + 1) << "次）";
     m_reloginTimer->start();
@@ -1458,11 +1458,54 @@ void MainWindow::sltStatus(const quint8 &status, const QJsonValue &dataVal)
     {
         const QJsonObject obj = dataVal.toObject();
         const QJsonObject keys = obj.value("keys").toObject();
+        const QJsonObject sigs = obj.value("sigs").toObject();
+        const QString spub = obj.value("spub").toString();
+        KeyStore *ks = KeyStore::instance();
+
+        // 服务器公钥固定：首次记录，之后不一致就说明对面不是原来那台服务器
+        bool serverTrusted = true;
+        if (!spub.isEmpty()) {
+            serverTrusted = ks->pinServerKey(spub);
+            if (!serverTrusted) {
+                CMessageBox::Warning(this,
+                    "服务器公钥与本地记录不一致，公钥目录可能已被替换。\n本次收到的公钥一律不采用。",
+                    "身份校验");
+            }
+        }
+
         for (QJsonObject::const_iterator it = keys.constBegin(); it != keys.constEnd(); ++it) {
-            KeyStore::instance()->cachePubKey(it.key().toInt(), it.value().toString());
-            m_pendingKeyRequests.remove(it.key().toInt());
+            const int uid = it.key().toInt();
+            const QString pem = it.value().toString();
+            m_pendingKeyRequests.remove(uid);
+            if (uid <= 0 || pem.isEmpty()) continue;
+
+            // 目录条目必须带服务器签名，否则无法排除"服务器把公钥换掉"
+            const QString sigB64 = sigs.value(it.key()).toString();
+            if (!sigB64.isEmpty()) {
+                if (!serverTrusted) continue;
+                const QByteArray sig = QByteArray::fromBase64(sigB64.toLatin1());
+                if (!CryptoUtil::verifyDetached(spub, CryptoUtil::buildDirProof(uid, pem), sig)) {
+                    qWarning() << "[加密] 用户" << uid << "的公钥目录签名无效，已丢弃";
+                    continue;
+                }
+            }
+
+            if (!ks->cachePubKey(uid, pem)) {
+                // 与本地固定指纹冲突：必须人工核对，不能静默覆盖
+                const QString oldFp = ks->fingerprint(uid);
+                const QString newFp = KeyStore::fingerprintOf(pem);
+                const int ret = QMessageBox::warning(this, "对方公钥变更",
+                    QString("用户 %1 的公钥与本地记录不一致。\n\n本地记录：%2\n服务器给出：%3\n\n"
+                            "可能是对方换了设备，也可能是服务器被入侵后替换了公钥。\n"
+                            "建议通过电话等其他渠道与对方核对指纹后再决定。\n\n是否信任新公钥？")
+                        .arg(uid).arg(oldFp).arg(newFp),
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (ret == QMessageBox::Yes) ks->confirmKeyChange(uid, pem);
+            }
         }
         sltFlushPendingMessages();
+        // 公钥到齐了，之前因为"没有对方公钥"没解开的来信也一并补解
+        sltFlushPendingIncoming();
         break;
     }
     case KeyOperateFailed:
@@ -1564,6 +1607,20 @@ void MainWindow::sltStatus(const quint8 &status, const QJsonValue &dataVal)
     case SendAck:       // 服务端确认已受理我发出的某条消息
     {
         handleSendAck(dataVal);
+        break;
+    }
+    case SendRejected:  // 服务端拒绝转发（不是好友 / 不在群里）
+    {
+        const QJsonObject obj = dataVal.toObject();
+        const QString key = obj.value("key").toString();
+        const QString reason = obj.value("msg").toString("消息未发送");
+        for (ChatWindow *window : m_chatFriendWindows) {
+            if (window && window->hasMsgKey(key)) { window->failSendByKey(key); break; }
+        }
+        for (ChatWindow *window : m_chatGroupWindows) {
+            if (window && window->hasMsgKey(key)) { window->failSendByKey(key); break; }
+        }
+        notifyTray("消息未发送", reason);
         break;
     }
     case QuitGroupOk:       // 自己退群成功
@@ -2192,7 +2249,12 @@ void MainWindow::sendGroupMsg(const QJsonValue &dataVal)
         QString msg = jsonObj.value("msg").toString();
         QString head = jsonObj.value("head").toString();
         int type = jsonObj.value("type").toInt();
-        if(type == Face) msg = QString::number(jsonObj.value("msg").toInt());
+        // 表情下标是字符串（"74"）。不能用 QJsonValue::toInt()——它只认 JSON 数字，
+        // 字符串会返回 0，导致群里收到的表情永远画成第 1 张。
+        if(type == Face) {
+            const QJsonValue faceVal = jsonObj.value("msg");
+            msg = QString::number(faceVal.isDouble() ? faceVal.toInt() : msg.toInt());
+        }
         if(type == Files) groupId = jsonObj.value("to").toInt();
         qDebug() << "群消息类型" << type << "长度" << msg.size();
 
@@ -2902,6 +2964,17 @@ void MainWindow::uploadKeys()
 
     QJsonObject up;
     up.insert("pub", ks->localPubKey());
+
+    // 自签名：证明本机确实持有对应私钥，别人不能代为登记一个"我的"公钥
+    QByteArray sig;
+    if (CryptoUtil::signDetached(ks->localPrivKey(),
+                                 CryptoUtil::buildDirProof(MyApp::m_nId, ks->localPubKey()),
+                                 &sig)) {
+        up.insert("selfSig", QString::fromLatin1(sig.toBase64()));
+    } else {
+        qWarning() << "[加密] 公钥自签名失败：" << CryptoUtil::lastError();
+    }
+
     m_tcpSocket->sendMessage(UploadKeys, QJsonValue(up));
 
     qInfo() << "[加密] 已上报本机公钥（仅公钥，不含任何私钥材料）";
@@ -3064,9 +3137,13 @@ void MainWindow::sltFlushPendingIncoming()
 }
 
 /**
- * @brief 收到消息时，如果是密文包就用本机私钥解密
- * 解出来的明文会替换 msg 字段并去掉 enc 标记，后续流程与普通消息完全一致
- * @param result 0=正常（明文或解密成功） 1=本机密钥未就绪，需等待重试 2=确实解不开
+ * @brief 收到消息时解密并验证来源
+ *
+ * v2 与 v1 的关键差别：解密成功只代表"内容没被改"，
+ * 还要用发送者的已固定公钥验签，才能确认"这条消息确实是他发的"。
+ * 另外把外层 id/type/key 与签名头交叉比对，防止中继改投或改类型。
+ *
+ * @param result 0=正常（明文或校验通过） 1=本机密钥未就绪，需等待重试 2=校验失败
  */
 QJsonValue MainWindow::decryptIfNeeded(const QJsonValue &dataVal, int *result)
 {
@@ -3085,17 +3162,52 @@ QJsonValue MainWindow::decryptIfNeeded(const QJsonValue &dataVal, int *result)
     }
 
     const QString packet = obj.value("msg").toString();
-    QString plain, err;
-    if (ks->decrypt(packet, &plain, &err)) {
-        obj.insert("msg", plain);
+
+    // v3：发送者 uid 在密文里，得先解开才知道该向谁要公钥 ——
+    // 这一步只解包不验签，验签放在拿到公钥之后（见下面的 decryptAndVerify）。
+    MsgHeader probeHdr;
+    QByteArray probeRaw, probeSigIn, probeSig;
+    QString probeErr;
+    if (!ks->openEnvelope(packet, &probeHdr, &probeRaw, &probeSigIn, &probeSig, &probeErr)) {
+        qWarning() << "[加密] 消息无法解开：" << probeErr;
+        if (result) *result = 2;
+        obj.insert("msg", QString("[这条消息未能通过校验，已拒绝显示]"));
         obj.remove("enc");
         return QJsonValue(obj);
     }
 
-    // 到这里才是真的解不开：多半是这条密文里没有发给本人的那份密钥
-    qWarning() << "[加密] 消息解密失败：" << err;
+    if (probeHdr.from != MyApp::m_nId && !ks->hasPubKey(probeHdr.from)) {
+        requestPubKeys(QList<int>() << probeHdr.from);
+        if (result) *result = 1;
+        return dataVal;
+    }
+
+    // 群消息外层 id 是群号，发送者要单独放到 userId；单聊的 id 就是发送者。
+    // 服务端已经不再写 id/userId，这里的取值只为兼容旧报文，能被覆盖就覆盖。
+    const bool isGroupMsg = (probeHdr.scope == QLatin1String("group"));
+    const int outerFrom = isGroupMsg ? obj.value("userId").toInt()
+                                     : obj.value("id").toInt();
+    const int outerKind = obj.value("type").toInt();
+    const QString outerKey = obj.value("key").toString();
+
+    QString plain, err;
+    if (ks->decryptAndVerify(packet, outerFrom, outerKind, outerKey, &plain, nullptr, &err)) {
+        obj.insert("msg", plain);
+        // 发送者以密文里解出来的为准：服务端已经不再往转发报文里写 id，
+        // 就算它写了也是明文、不可信，这里一律覆盖。
+        if (isGroupMsg) obj.insert("userId", probeHdr.from);
+        else            obj.insert("id", probeHdr.from);
+        obj.remove("enc");
+        return QJsonValue(obj);
+    }
+
+    qWarning() << "[加密] 消息未通过校验：" << err;
     if (result) *result = 2;
-    obj.insert("msg", QString("[这条消息无法解密：不是发给本机的密文]"));
+    // 验签失败的消息不能伪装成对方的正常发言，必须明确标出来。
+    // 但发送者该填还是要填：密文解得出是谁，只是签名对不上。
+    if (isGroupMsg) obj.insert("userId", probeHdr.from);
+    else            obj.insert("id", probeHdr.from);
+    obj.insert("msg", QString("[这条消息未通过身份校验，已拒绝显示]"));
     obj.remove("enc");
     return QJsonValue(obj);
 }
@@ -3170,17 +3282,27 @@ bool MainWindow::encryptOutgoing(QJsonValue &dataVal, quint8 type, int *reason)
         return false;
     }
 
+    const int kind = obj.value("type").toInt();
+    const QString msgKey = obj.value("key").toString();
+
     QList<int> recipients;
-    if (type == SendGroupMsg) {
-        // 群文件消息历史上把发送者放在 id、群号放在 to，这里跟着服务端的口径做兼容
-        int gid = obj.value("id").toInt();
-        if (obj.value("type").toInt() == Files) gid = obj.value("to").toInt();
-        recipients = DatabaseMsg::getInstance()->getGroupMemberIds(gid);
+    int toId = 0;
+    const bool isGroup = (type == SendGroupMsg);
+
+    if (isGroup) {
+        // 群文件消息历史上把群号放在 to，其余放 id
+        toId = (kind == Files) ? obj.value("to").toInt() : obj.value("id").toInt();
+        recipients = DatabaseMsg::getInstance()->getGroupMemberIds(toId);
+    } else if (type == SendFile) {
+        // 私聊文件消息：id 是发送者自己，to 才是接收者
+        toId = obj.value("to").toInt();
+        if (toId > 0) recipients << toId;
     } else {
-        recipients << obj.value("id").toInt();
+        toId = obj.value("id").toInt();
+        if (toId > 0) recipients << toId;
     }
     recipients.removeAll(MyApp::m_nId);       // 自己那份由 KeyStore 自动补
-    if (recipients.isEmpty()) {
+    if (recipients.isEmpty() || toId <= 0) {
         if (reason) *reason = 2;
         return false;
     }
@@ -3193,8 +3315,8 @@ bool MainWindow::encryptOutgoing(QJsonValue &dataVal, quint8 type, int *reason)
     }
 
     QString err;
-    const QString packet = ks->encryptFor(obj.value("msg").toString(), recipients,
-                                          MyApp::m_nId, &err);
+    const QString packet = ks->encryptForV2(obj.value("msg").toString(), recipients,
+                                            MyApp::m_nId, toId, isGroup, kind, msgKey, &err);
     if (packet.isEmpty()) {
         qWarning() << "[加密] 加密消息失败：" << err;
         if (reason) *reason = 2;
@@ -3212,8 +3334,8 @@ bool MainWindow::encryptOutgoing(QJsonValue &dataVal, quint8 type, int *reason)
  */
 void MainWindow::sltChatSendMessage(const quint8 &type, const QJsonValue &dataVal)
 {
-    // 聊天类消息统一走加密：文字 / 图片 / 语音 / 表情 / 群文件元信息
-    if (type != SendMsg && type != SendGroupMsg && type != SendFace) {
+    // 聊天类消息统一走加密：文字 / 图片 / 语音 / 表情 / 文件元信息
+    if (type != SendMsg && type != SendGroupMsg && type != SendFace && type != SendFile) {
         m_tcpSocket->sendMessage(type, dataVal);
         return;
     }

@@ -5,6 +5,7 @@
 #include <openssl/rsa.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/hmac.h>
 #include <openssl/opensslv.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -12,6 +13,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -207,6 +209,12 @@ bool CryptoUtil::savePrivateKey(const QString &filePath, const QString &privPem)
     }
     file.write(privPem.toLatin1());
     file.close();
+
+    // 私钥只给自己读写。Linux 上默认权限跟着 umask 走（常见 644），同机别的用户
+    // 能直接把服务器身份私钥读走 —— 客户端靠它的公钥指纹认服务器，泄露就等于能被冒充。
+    // Windows 上 setPermissions 只影响只读位、不碰 ACL，设了也无害。
+    QFile::setPermissions(filePath, QFile::ReadOwner | QFile::WriteOwner);
+
     return true;
 }
 
@@ -321,7 +329,18 @@ bool CryptoUtil::isPacket(const QString &text)
 {
     const QString t = text.trimmed();
     if (!t.startsWith('{')) return false;
-    return t.contains("\"alg\"") && t.contains("\"eks\"") && t.contains("\"ct\"");
+
+    const QJsonObject obj = QJsonDocument::fromJson(t.toUtf8()).object();
+    if (obj.isEmpty()) return false;
+
+    // 按"密文的共同特征"判定，不按版本号分支——历史上出现过三种信封：
+    //   v1：{alg, iv, ct, tag, eks:{uid:…}}
+    //   v2：{v:2, hdr, iv, ct, tag, eks:{uid:…}, sig}
+    //   v3：{v:3, hdr, iv, ct, tag, eks:[…],  sig}   ← eks 改数组、不再有 alg
+    // 只看 v>=3 会漏掉数据库里的 v1/v2 旧记录，审计页就把它们算成"未加密"。
+    if (!obj.contains("ct") || !obj.contains("tag") || !obj.contains("iv")) return false;
+    const QJsonValue eks = obj.value("eks");
+    return eks.isArray() || eks.isObject();
 }
 
 QString CryptoUtil::encryptMessage(const QString &plain, const QMap<int, QString> &recipients)
@@ -479,7 +498,407 @@ QList<int> CryptoUtil::packetRecipients(const QString &packet)
     const QJsonDocument doc = QJsonDocument::fromJson(packet.toUtf8());
     if (!doc.isObject()) return ids;
     const QJsonObject eks = doc.object().value("eks").toObject();
+    // v3 的 eks 是数组、刻意不标 uid，所以这里必然为空：
+    // 服务器能知道的极限只是"这份消息给几个人各包了一份密钥"，即 packetKeyCount()。
     for (QJsonObject::const_iterator it = eks.constBegin(); it != eks.constEnd(); ++it)
         ids.append(it.key().toInt());
     return ids;
+}
+
+int CryptoUtil::packetKeyCount(const QString &packet)
+{
+    const QJsonDocument doc = QJsonDocument::fromJson(packet.toUtf8());
+    if (!doc.isObject()) return 0;
+    const QJsonValue eks = doc.object().value("eks");
+    if (eks.isArray())  return eks.toArray().size();      // v3
+    if (eks.isObject()) return eks.toObject().size();     // v2
+    return 0;
+}
+
+// ==================================================================
+// 数字签名（服务器侧：签公钥目录、验公钥自签名）
+// ==================================================================
+static void appendU64BE(QByteArray &buf, quint64 v)
+{
+    for (int i = 7; i >= 0; --i)
+        buf.append(static_cast<char>((v >> (i * 8)) & 0xFF));
+}
+
+QByteArray CryptoUtil::sha256(const QByteArray &data)
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (EVP_Digest(data.constData(), size_t(data.size()), md, &len, EVP_sha256(), nullptr) != 1)
+        return QByteArray();
+    return QByteArray(reinterpret_cast<const char *>(md), int(len));
+}
+
+bool CryptoUtil::signDetached(const QString &privPem, const QByteArray &data, QByteArray *sig)
+{
+    clearError();
+    if (!sig) return false;
+    EVP_PKEY *pkey = pemToPrivateKey(privPem);
+    if (!pkey) return false;
+
+    bool ok = false;
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = nullptr;
+    do {
+        if (!md) { setError("创建签名上下文失败"); break; }
+        if (EVP_DigestSignInit(md, &pctx, EVP_sha256(), nullptr, pkey) != 1) {
+            setError(collectErrors("初始化签名失败")); break;
+        }
+        if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0) { setError("设置 PSS 填充失败"); break; }
+        if (EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) <= 0) { setError("设置盐长度失败"); break; }
+
+        size_t len = 0;
+        if (EVP_DigestSign(md, nullptr, &len,
+                           reinterpret_cast<const unsigned char *>(data.constData()),
+                           size_t(data.size())) != 1) {
+            setError(collectErrors("计算签名长度失败")); break;
+        }
+        sig->resize(int(len));
+        if (EVP_DigestSign(md, reinterpret_cast<unsigned char *>(sig->data()), &len,
+                           reinterpret_cast<const unsigned char *>(data.constData()),
+                           size_t(data.size())) != 1) {
+            sig->clear();
+            setError(collectErrors("签名失败")); break;
+        }
+        sig->resize(int(len));
+        ok = true;
+    } while (false);
+
+    if (md) EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+bool CryptoUtil::verifyDetached(const QString &pubPem, const QByteArray &data, const QByteArray &sig)
+{
+    clearError();
+    if (pubPem.trimmed().isEmpty() || sig.isEmpty()) return false;
+    EVP_PKEY *pkey = pemToPublicKey(pubPem);
+    if (!pkey) return false;
+
+    bool ok = false;
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = nullptr;
+    do {
+        if (!md) break;
+        if (EVP_DigestVerifyInit(md, &pctx, EVP_sha256(), nullptr, pkey) != 1) break;
+        if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0) break;
+        if (EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) <= 0) break;
+        ok = (EVP_DigestVerify(md,
+                               reinterpret_cast<const unsigned char *>(sig.constData()),
+                               size_t(sig.size()),
+                               reinterpret_cast<const unsigned char *>(data.constData()),
+                               size_t(data.size())) == 1);
+    } while (false);
+
+    if (md) EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+QByteArray CryptoUtil::buildDirProof(int uid, const QString &pubPem)
+{
+    QByteArray buf("MC2/DIR/v2", 10);
+    buf.append('\0');
+    appendU64BE(buf, static_cast<quint64>(uid));
+    buf.append(sha256(pubPem.trimmed().toUtf8()));
+    return buf;
+}
+
+// ==================================================================
+// 链路层原语（P2 握手）
+//
+// 这一段在客户端与服务端是**逐字相同**的：握手两侧必须用同一套
+// 字节序、同一套派生规则，否则算出来的密钥对不上。改动时务必两边同步。
+// ==================================================================
+namespace {
+
+/// 全零检测：X25519 遇到低阶点会导出全零，这时必须中止而不是当密钥用
+bool isAllZero(const QByteArray &data)
+{
+    unsigned char acc = 0;
+    for (int i = 0; i < data.size(); ++i)
+        acc |= static_cast<unsigned char>(data.at(i));
+    return acc == 0;
+}
+
+/// 带 AAD 的 AES-256-GCM（单次，非流式）
+bool mc2GcmSeal(const QByteArray &key, const QByteArray &nonce, const QByteArray &aad,
+                const QByteArray &plain, QByteArray *ct, QByteArray *tag)
+{
+    bool ok = false;
+    QByteArray out(plain.size() + 16, 0);
+    tag->resize(16);
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    do {
+        if (!ctx) break;
+        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce.size(), nullptr) != 1) break;
+        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr,
+                               reinterpret_cast<const unsigned char *>(key.constData()),
+                               reinterpret_cast<const unsigned char *>(nonce.constData())) != 1) break;
+        int len = 0;
+        if (!aad.isEmpty()) {
+            if (EVP_EncryptUpdate(ctx, nullptr, &len,
+                                  reinterpret_cast<const unsigned char *>(aad.constData()),
+                                  aad.size()) != 1) break;
+        }
+        int total = 0;
+        if (EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char *>(out.data()), &len,
+                              reinterpret_cast<const unsigned char *>(plain.constData()),
+                              plain.size()) != 1) break;
+        total = len;
+        if (EVP_EncryptFinal_ex(ctx, reinterpret_cast<unsigned char *>(out.data()) + total, &len) != 1) break;
+        total += len;
+        out.resize(total);
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag->data()) != 1) break;
+        *ct = out;
+        ok = true;
+    } while (false);
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+bool mc2GcmOpen(const QByteArray &key, const QByteArray &nonce, const QByteArray &aad,
+                const QByteArray &ct, const QByteArray &tag, QByteArray *plain)
+{
+    bool ok = false;
+    QByteArray out(ct.size() + 16, 0);
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    do {
+        if (!ctx) break;
+        if (tag.size() != 16) break;
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, nonce.size(), nullptr) != 1) break;
+        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr,
+                               reinterpret_cast<const unsigned char *>(key.constData()),
+                               reinterpret_cast<const unsigned char *>(nonce.constData())) != 1) break;
+        int len = 0;
+        if (!aad.isEmpty()) {
+            if (EVP_DecryptUpdate(ctx, nullptr, &len,
+                                  reinterpret_cast<const unsigned char *>(aad.constData()),
+                                  aad.size()) != 1) break;
+        }
+        int total = 0;
+        if (EVP_DecryptUpdate(ctx, reinterpret_cast<unsigned char *>(out.data()), &len,
+                              reinterpret_cast<const unsigned char *>(ct.constData()),
+                              ct.size()) != 1) break;
+        total = len;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
+                                const_cast<char *>(tag.constData())) != 1) break;
+        if (EVP_DecryptFinal_ex(ctx, reinterpret_cast<unsigned char *>(out.data()) + total, &len) <= 0) break;
+        total += len;
+        out.resize(total);
+        *plain = out;
+        ok = true;
+    } while (false);
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+} // namespace
+
+bool CryptoUtil::random(int len, QByteArray *out)
+{
+    if (!out || len <= 0) return false;
+    const QByteArray buf = randomBytes(len);
+    if (buf.size() != len) return false;
+    *out = buf;
+    return true;
+}
+
+QByteArray CryptoUtil::hmacSha256(const QByteArray &key, const QByteArray &data)
+{
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (HMAC(EVP_sha256(),
+             key.constData(), key.size(),
+             reinterpret_cast<const unsigned char *>(data.constData()), size_t(data.size()),
+             md, &len) == nullptr) {
+        setError(collectErrors("HMAC-SHA256 计算失败"));
+        return QByteArray();
+    }
+    return QByteArray(reinterpret_cast<const char *>(md), int(len));
+}
+
+QByteArray CryptoUtil::pbkdf2Sha256(const QByteArray &pass, const QByteArray &salt,
+                                    int iterations, int outLen)
+{
+    if (iterations <= 0 || outLen <= 0) return QByteArray();
+    QByteArray out(outLen, 0);
+    if (PKCS5_PBKDF2_HMAC(pass.constData(), pass.size(),
+                          reinterpret_cast<const unsigned char *>(salt.constData()), salt.size(),
+                          iterations, EVP_sha256(), outLen,
+                          reinterpret_cast<unsigned char *>(out.data())) != 1) {
+        setError(collectErrors("PBKDF2 计算失败"));
+        return QByteArray();
+    }
+    return out;
+}
+
+bool CryptoUtil::constantTimeEquals(const QByteArray &a, const QByteArray &b)
+{
+    // 长度不同直接判否（长度本身不是秘密），内容逐字节异或累积，不提前返回
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (int i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned char>(a.at(i) ^ b.at(i));
+    return diff == 0;
+}
+
+bool CryptoUtil::generateX25519KeyPair(QByteArray *priv, QByteArray *pub)
+{
+    clearError();
+    if (!priv || !pub) return false;
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr);
+    if (!ctx) { setError(collectErrors("创建 X25519 上下文失败")); return false; }
+
+    EVP_PKEY *pkey = nullptr;
+    bool ok = false;
+    do {
+        if (EVP_PKEY_keygen_init(ctx) != 1) { setError(collectErrors("初始化 X25519 密钥生成失败")); break; }
+        if (EVP_PKEY_keygen(ctx, &pkey) != 1) { setError(collectErrors("生成 X25519 密钥失败")); break; }
+
+        QByteArray sk(32, 0), pk(32, 0);
+        size_t skLen = 32, pkLen = 32;
+        if (EVP_PKEY_get_raw_private_key(pkey, reinterpret_cast<unsigned char *>(sk.data()), &skLen) != 1) {
+            setError(collectErrors("导出 X25519 私钥失败")); break;
+        }
+        if (EVP_PKEY_get_raw_public_key(pkey, reinterpret_cast<unsigned char *>(pk.data()), &pkLen) != 1) {
+            setError(collectErrors("导出 X25519 公钥失败")); break;
+        }
+        sk.resize(int(skLen));
+        pk.resize(int(pkLen));
+        if (sk.size() != 32 || pk.size() != 32) { setError("X25519 密钥长度不是 32 字节"); break; }
+        *priv = sk;
+        *pub  = pk;
+        ok = true;
+    } while (false);
+
+    if (pkey) EVP_PKEY_free(pkey);
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
+}
+
+QByteArray CryptoUtil::x25519PublicFromPrivate(const QByteArray &priv)
+{
+    if (priv.size() != 32) return QByteArray();
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(
+                EVP_PKEY_X25519, nullptr,
+                reinterpret_cast<const unsigned char *>(priv.constData()), 32);
+    if (!pkey) return QByteArray();
+
+    QByteArray pk(32, 0);
+    size_t len = 32;
+    const bool ok = (EVP_PKEY_get_raw_public_key(
+                         pkey, reinterpret_cast<unsigned char *>(pk.data()), &len) == 1);
+    EVP_PKEY_free(pkey);
+    if (!ok) return QByteArray();
+    pk.resize(int(len));
+    return pk;
+}
+
+bool CryptoUtil::x25519SharedSecret(const QByteArray &priv, const QByteArray &peerPub,
+                                    QByteArray *secret)
+{
+    clearError();
+    if (!secret) return false;
+    if (priv.size() != 32 || peerPub.size() != 32) {
+        setError("X25519 密钥长度不正确");
+        return false;
+    }
+
+    EVP_PKEY *mine = EVP_PKEY_new_raw_private_key(
+                EVP_PKEY_X25519, nullptr,
+                reinterpret_cast<const unsigned char *>(priv.constData()), 32);
+    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(
+                EVP_PKEY_X25519, nullptr,
+                reinterpret_cast<const unsigned char *>(peerPub.constData()), 32);
+    EVP_PKEY_CTX *ctx = nullptr;
+    bool ok = false;
+    do {
+        if (!mine || !peer) { setError(collectErrors("加载 X25519 密钥失败")); break; }
+        ctx = EVP_PKEY_CTX_new(mine, nullptr);
+        if (!ctx) { setError(collectErrors("创建 X25519 派生上下文失败")); break; }
+        if (EVP_PKEY_derive_init(ctx) != 1) { setError(collectErrors("初始化 X25519 派生失败")); break; }
+        if (EVP_PKEY_derive_set_peer(ctx, peer) != 1) { setError(collectErrors("设置对端 X25519 公钥失败")); break; }
+
+        size_t len = 0;
+        if (EVP_PKEY_derive(ctx, nullptr, &len) != 1) { setError(collectErrors("计算共享密钥长度失败")); break; }
+        QByteArray out(int(len), 0);
+        if (EVP_PKEY_derive(ctx, reinterpret_cast<unsigned char *>(out.data()), &len) != 1) {
+            setError(collectErrors("导出 X25519 共享密钥失败")); break;
+        }
+        out.resize(int(len));
+        if (out.isEmpty() || isAllZero(out)) {
+            setError("对端 X25519 公钥是低阶点，共享密钥为全零");
+            break;
+        }
+        *secret = out;
+        ok = true;
+    } while (false);
+
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (mine) EVP_PKEY_free(mine);
+    if (peer) EVP_PKEY_free(peer);
+    return ok;
+}
+
+QByteArray CryptoUtil::hkdfExtract(const QByteArray &salt, const QByteArray &ikm)
+{
+    // RFC 5869 §2.2：salt 缺省时取 HashLen 个 0
+    const QByteArray s = salt.isEmpty() ? QByteArray(32, '\0') : salt;
+    return hmacSha256(s, ikm);
+}
+
+QByteArray CryptoUtil::hkdfExpand(const QByteArray &prk, const QByteArray &info, int len)
+{
+    // RFC 5869 §2.3：T(i) = HMAC(PRK, T(i-1) ‖ info ‖ i)，i 从 1 起
+    if (prk.isEmpty() || len <= 0 || len > 255 * 32) return QByteArray();
+    QByteArray out;
+    QByteArray block;
+    for (int i = 1; out.size() < len; ++i) {
+        block = hmacSha256(prk, block + info + QByteArray(1, static_cast<char>(i)));
+        if (block.isEmpty()) return QByteArray();
+        out.append(block);
+    }
+    out.truncate(len);
+    return out;
+}
+
+bool CryptoUtil::aesGcmSeal(const QByteArray &key, const QByteArray &nonce, const QByteArray &aad,
+                            const QByteArray &plain, QByteArray *ct, QByteArray *tag)
+{
+    clearError();
+    if (!ct || !tag) return false;
+    if (key.size() != 32 || nonce.isEmpty() || nonce.size() > 16) {
+        setError("AES-GCM 参数不合法");
+        return false;
+    }
+    if (!mc2GcmSeal(key, nonce, aad, plain, ct, tag)) {
+        setError(collectErrors("AES-GCM 加密失败"));
+        return false;
+    }
+    return true;
+}
+
+bool CryptoUtil::aesGcmOpen(const QByteArray &key, const QByteArray &nonce, const QByteArray &aad,
+                            const QByteArray &ct, const QByteArray &tag, QByteArray *plain)
+{
+    clearError();
+    if (!plain) return false;
+    if (key.size() != 32 || nonce.isEmpty() || nonce.size() > 16 || tag.size() != 16) {
+        setError("AES-GCM 参数不合法");
+        return false;
+    }
+    if (!mc2GcmOpen(key, nonce, aad, ct, tag, plain)) {
+        setError("AES-GCM 校验失败（密文被改或密钥不对）");
+        return false;
+    }
+    return true;
 }

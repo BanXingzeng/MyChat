@@ -34,7 +34,7 @@ protected:
 
     void paintEvent(QPaintEvent *);
 public:
-    QQCell *cell;
+    QQCell *cell = nullptr;
 private:
     bool m_bEntered;
 

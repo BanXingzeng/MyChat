@@ -90,7 +90,8 @@ QString MyApp::m_strRecordPath      = "";
 QString MyApp::m_strIniFile         = "config.ini";
 
 // 服务器相关配置
-QString MyApp::m_strHostAddr        = "127.0.0.1";
+// 出厂默认连公网服务器；config.ini 里的 [Server] ServerIP 优先于它
+QString MyApp::m_strHostAddr        = "8.141.105.64";
 quint16     MyApp::m_nMsgPort           = 60101;
 quint16     MyApp::m_nFilePort          = 60102;
 quint16     MyApp::m_nGroupPort         = 60103;
@@ -204,6 +205,9 @@ void MyApp::CheckDirs()
     createDir(m_strFacePath);
     createDir(m_strHeadPath);
     createDir(m_strSoundPath);
+    createDir(m_strRecordPath);
+    // 图片消息会落盘到 Data/Images（见 global.h SaveInlineImage），提前建好
+    createDir(m_strDataPath + "Images/");
 }
 
 void MyApp::CheckSound()

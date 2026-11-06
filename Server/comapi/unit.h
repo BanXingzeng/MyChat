@@ -235,6 +235,9 @@ typedef enum {
     // 服务端收到并受理一条消息后，把消息里的 key 原样回给发送者。
     // 客户端据此把气泡置为"已送达"，超时没收到回执就标红提示可重发。
     SendAck             = 0x7E,
+
+    // 服务端拒绝转发（如对方不是好友）：带 key 与原因，客户端把气泡标红
+    SendRejected        = 0x7F,
 } E_STATUS;
 
 #endif // UNIT

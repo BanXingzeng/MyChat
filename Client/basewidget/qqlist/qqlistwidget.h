@@ -38,8 +38,8 @@ public slots:
 
 private:
     QList<QQCell *> cells;                      //所有的数据
-    QMenu *mGroupMenu;
-    QMenu *mChildMenu;
+    QMenu *mGroupMenu = nullptr;
+    QMenu *mChildMenu = nullptr;
 
     QQCell *m_nRightClickCell;
 public:

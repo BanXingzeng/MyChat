@@ -94,6 +94,9 @@ private:
     void initAuditPage();          // 消息审计页（端到端加密：只看密文与元数据）
 
     void appendLog(const QString &text, const QString &color = QStringLiteral("#333333"));
+    void flushLogs();                  // 批量把攒下的日志一次性刷进日志框（100ms 合并）
+    void scheduleUserTableRefresh();   // 合并短时间内的多次刷新请求
+    void flushUserTableRefresh();
     void showLoginTip(const QString &text);
     void notifyTray(const QString &title, const QString &msg, bool warn = false,
                     const QString &logColor = QStringLiteral("#1a7f37"));
@@ -137,6 +140,13 @@ private:
     QTimer *m_timer;
     QDateTime m_dtStart;
     QString   m_strHostIp;
+
+    // 日志与界面刷新的节流（高并发下 GUI 线程是瓶颈，不能让每条日志/每次上线都重绘）
+    QStringList m_pendingLogs;      // 待刷新的日志行
+    QTimer     *m_logFlushTimer;    // 100ms 单次触发，把一批日志合并成一次 append
+    qint64      m_msLastTrayTip;    // 上次更新托盘提示的时间戳（限频 1s）
+    QTimer     *m_userTableTimer;   // 用户表重建的去抖
+    bool        m_bUserTableDirty;  // 用户表是否需要重建
 
     // 用户管理
     QStandardItemModel *m_userModel;

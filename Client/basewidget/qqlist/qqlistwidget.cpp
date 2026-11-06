@@ -4,9 +4,11 @@
 #include <QDebug>
 
 QQListWidget::QQListWidget(QWidget *parent) :
-    QListWidget(parent)
+    QListWidget(parent),
+    mGroupMenu(nullptr),      // 未初始化时会被当成有效指针传给子控件
+    mChildMenu(nullptr),
+    m_nRightClickCell(nullptr)
 {
-    m_nRightClickCell = nullptr;
 }
 
 QQCell *QQListWidget::GetRightClickedCell()
@@ -14,14 +16,41 @@ QQCell *QQListWidget::GetRightClickedCell()
     return m_nRightClickCell;
 }
 
+/**
+ * @brief QQListWidget::setGroupPopMenu
+ * insertQQCell 内部会立刻 upload() 建控件，那时菜单可能还没创建；
+ * 所以这里除了记下菜单，还要把已存在的组控件重新绑一遍，保证顺序无关。
+ */
 void QQListWidget::setGroupPopMenu(QMenu *menu)
 {
     mGroupMenu = menu;
+
+    for (int i = 0; i < count(); ++i)
+    {
+        QQListViewGroup *group = qobject_cast<QQListViewGroup *>(itemWidget(item(i)));
+        if (nullptr != group)
+        {
+            group->setPopMenu(menu);
+        }
+    }
 }
 
+/**
+ * @brief QQListWidget::setChildPopMenu
+ * 同上：已经建好的子项也要换成新菜单，否则右键弹出的是空指针/旧菜单。
+ */
 void QQListWidget::setChildPopMenu(QMenu *menu)
 {
     mChildMenu = menu;
+
+    for (int i = 0; i < count(); ++i)
+    {
+        QQListViewChild *child = qobject_cast<QQListViewChild *>(itemWidget(item(i)));
+        if (nullptr != child)
+        {
+            child->setPopMenu(menu);
+        }
+    }
 }
 
 void QQListWidget::insertQQCell(QQCell * cell)
@@ -72,14 +101,14 @@ void QQListWidget::removeQQCell(QQCell * cell)
 
 void QQListWidget::clearAllCells()
 {
+    // 先把列表控件删掉，再删数据：控件里存着 QQCell 指针，
+    // 反过来的话控件在当前调用返回前仍可能被绘制/读取到已释放的 cell。
+    m_nRightClickCell = nullptr;    // 先掐掉右键目标的悬空引用
+    clearListWidgetItems();
+
     for(QQCell* groupCell : cells){
         if(groupCell != nullptr){
-            for(QQCell* childCell : groupCell->childs){
-                if(childCell != nullptr){
-                    delete childCell;
-                    childCell = nullptr;
-                }
-            }
+            qDeleteAll(groupCell->childs);
             groupCell->childs.clear(); // 清空子项列表，避免野指针
 
             delete groupCell;
@@ -88,9 +117,6 @@ void QQListWidget::clearAllCells()
     }
 
     cells.clear();  //清空数据，防止访问野指针
-    m_nRightClickCell = nullptr;    // 右键选中的 cell 已经被释放了
-
-    clearListWidgetItems();
 }
 
 void QQListWidget::clearListWidgetItems()

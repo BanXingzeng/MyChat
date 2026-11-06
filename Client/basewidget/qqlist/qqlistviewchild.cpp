@@ -7,9 +7,10 @@
 #include <QFontMetrics>
 
 QQListViewChild::QQListViewChild(QQPopMenuWidget *parent) :
-    QQPopMenuWidget(parent)
+    QQPopMenuWidget(parent),
+    cell(nullptr),        // 未初始化时 paintEvent 里的 cell == nullptr 判空会失效
+    m_bEntered(false)
 {
-    m_bEntered = false;
 }
 
 QQListViewChild::~QQListViewChild()
@@ -32,6 +33,8 @@ void QQListViewChild::mousePressEvent(QMouseEvent *ev)
 
 void QQListViewChild::mouseDoubleClickEvent(QMouseEvent * /*event*/)
 {
+    if (nullptr == cell) return;
+
     emit onChildDidDoubleClicked(this->cell);
 }
 

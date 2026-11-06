@@ -1,4 +1,4 @@
-#include "FileSocket.h"
+#include "filesocket.h"
 #include <QFileInfo>
 #include <QDir>
 #include <QDebug>

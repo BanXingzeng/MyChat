@@ -33,7 +33,21 @@ public:
     // 注册用户
     E_STATUS userRegister(const QString &name, const QString &passwd);
     QJsonObject userLogin(const QString &name,const QString &passwd);
+
+    // ===== 协议 v2：挑战-应答登录（口令不出客户端） =====
+    /// 取出该用户的口令派生参数（salt / 迭代次数 / verifier）。
+    /// verifier 就是库里 digest 那一项，服务端只拿它重算 HMAC，永远不知道口令原文。
+    /// 用户不存在或口令尚未迁移成哈希时返回 false，调用方应回一个"假挑战"，避免用户名枚举。
+    bool authParams(const QString &name, int *uid, QByteArray *salt,
+                    int *iterations, QByteArray *verifier);
+    /// 认证通过后按 uid 组装登录回执（结构与原 userLogin 一致，含在线/顶号判定）
+    QJsonObject loginResultById(int uid);
+
     bool isFriend(const int &userId,const QString &friendName);
+    /// 按 id 判断好友关系：发送消息前的授权校验用
+    bool isFriendById(int userId, int friendId);
+    /// 判断某人是否在群里：群消息转发前的授权校验用
+    bool isGroupMember(int groupId, int userId);
     QString getUserHead(const int &userId);
     bool updateUserHead(const int &userId, const QString &head);   // 更新用户头像文件名
 

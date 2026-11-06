@@ -2,7 +2,8 @@
 
 QQListViewGroup::QQListViewGroup(QQPopMenuWidget *parent) :
     QQPopMenuWidget(parent),
-    ui(new Ui::QQListViewGroup)
+    ui(new Ui::QQListViewGroup),
+    cell(nullptr)         // 未初始化时下面的 cell == nullptr 判空会失效
 {
     ui->setupUi(this);
 
@@ -31,7 +32,13 @@ void QQListViewGroup::setQQCell(QQCell *c)
 
 void QQListViewGroup::mousePressEvent(QMouseEvent *ev)
 {
-    QQPopMenuWidget::mousePressEvent(ev);
+    if (Qt::RightButton == ev->button())
+    {
+        // 右键交给基类弹菜单。exec() 是阻塞的，用户点"刷新/删除该组"会重建整个列表，
+        // 本对象可能已经被 delete —— 所以弹完立刻返回，绝不能再访问 this 的任何成员。
+        QQPopMenuWidget::mousePressEvent(ev);
+        return;
+    }
 
     if (ev->button() != Qt::LeftButton)
     {

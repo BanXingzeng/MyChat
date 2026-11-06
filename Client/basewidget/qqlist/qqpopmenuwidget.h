@@ -25,7 +25,7 @@ public:
 protected slots:
 
 protected:
-    QMenu *popMenu;
+    QMenu *popMenu = nullptr;
 
 public:
     virtual void mousePressEvent(QMouseEvent *event);

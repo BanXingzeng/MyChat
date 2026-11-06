@@ -1,7 +1,8 @@
 #include "qqpopmenuwidget.h"
 
 QQPopMenuWidget::QQPopMenuWidget(QWidget *parent) :
-    CustomWidget(parent)
+    CustomWidget(parent),
+    popMenu(nullptr)      // 必须初始化：否则右键时对野指针判空会漏过，exec 直接崩
 {
 }
 

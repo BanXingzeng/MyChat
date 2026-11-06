@@ -1,7 +1,9 @@
 #include "clientsocket.h"
 #include "databasemag.h"
 #include "myserver.h"
+#include "handshake.h"
 #include "comapi/unit.h"
+#include "comapi/cryptoutil.h"
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -10,7 +12,64 @@
 #include <QDateTime>
 #include <QImage>
 #include <QDir>
+#include <QMutex>
+#include <QHash>
+#include <QSet>
 #include "comapi/myapp.h"
+
+// ------------------------------------------------------------------
+// 服务器身份密钥
+//
+// 实现在 handshake.cpp 的 ServerIdentity 里：它既给握手报文签名，
+// 也给「公钥目录」签名，证明这份目录确实出自本服务器。
+// 不参与任何消息加解密 —— 服务器依然不持有任何用户私钥。
+// ------------------------------------------------------------------
+static inline QString serverPrivPem() { return ServerIdentity::privateKeyPem(); }
+static inline QString serverPubPem()  { return ServerIdentity::publicKeyPem();  }
+
+// ------------------------------------------------------------------
+// 口令枚举防护
+//
+// 挑战-应答本身要算一次 PBKDF2（10 万次迭代），攻击者每猜一次都得自己
+// 付这份算力，等价于离线爆破成本；再加一层按用户名的失败计数，
+// 把"在线猜"也堵掉。计数放内存，重启清零——毕设规模够用，
+// 真要持久化应该落在账号表上（见文档 §15 局限）。
+// ------------------------------------------------------------------
+namespace {
+
+QMutex g_authMutex;
+QHash<QString, QPair<int, qint64>> g_authFail;   // 用户名 -> (连续失败次数, 锁到哪个时刻)
+
+const int kMaxFailures = 5;
+const qint64 kLockMs = 5 * 60 * 1000;
+
+bool authLocked(const QString &name)
+{
+    QMutexLocker lock(&g_authMutex);
+    const QPair<int, qint64> rec = g_authFail.value(name);
+    return rec.first >= kMaxFailures && QDateTime::currentMSecsSinceEpoch() < rec.second;
+}
+
+void authNoteFailure(const QString &name)
+{
+    QMutexLocker lock(&g_authMutex);
+    QPair<int, qint64> rec = g_authFail.value(name);
+    ++rec.first;
+    if (rec.first >= kMaxFailures)
+        rec.second = QDateTime::currentMSecsSinceEpoch() + kLockMs;
+    g_authFail.insert(name, rec);
+    qWarning() << "[认证] 用户" << name << "认证失败" << rec.first << "次";
+}
+
+void authNoteSuccess(const QString &name)
+{
+    QMutexLocker lock(&g_authMutex);
+    g_authFail.remove(name);
+}
+
+} // namespace
+
+
 
 // 把客户端传来的图片统一裁剪成 96x96 的正方形头像
 static QImage NormalizedHead(const QByteArray &raw)
@@ -41,6 +100,22 @@ ClientSocket::ClientSocket(QObject *parent, QTcpSocket *tcpSocket)
     connect(m_tcpSocket, SIGNAL(connected()), this, SLOT(SltConnected()));
     connect(m_tcpSocket, SIGNAL(disconnected()), this, SLOT(SltDisconnected()));
 
+    // 协议 v2：每条连接自带一条加密通道，握手完成前不接受任何业务报文
+    m_channel = new SecureChannel(SecureChannel::Server, this);
+    m_channel->setServerPrivateKey(ServerIdentity::privateKeyPem());
+    connect(m_channel, &SecureChannel::handshakeReady, this, [this]() {
+        qInfo() << "[握手] 链路已加密，来自" << m_tcpSocket->peerAddress().toString();
+    });
+    connect(m_channel, &SecureChannel::handshakeFailed, this, [this](const QString &reason) {
+        // 握手失败一律断链：不降级、不给"先明文聊着"的机会
+        qWarning() << "[握手] 断开连接：" << reason;
+        m_tcpSocket->abort();
+    });
+}
+
+bool ClientSocket::isSecure() const
+{
+    return m_channel && m_channel->isReady();
 }
 
 ClientSocket::~ClientSocket()
@@ -503,6 +578,20 @@ void ClientSocket::ParseUploadKeys(const QJsonValue &dataVal)
         return;
     }
 
+    // 自签名校验：证明上传者确实持有对应私钥，
+    // 否则别人可以先把自己的公钥登记成"某人的公钥"。
+    const QString selfSig = jsonObj.value("selfSig").toString();
+    const bool sigOk = !selfSig.isEmpty()
+            && CryptoUtil::verifyDetached(pubKey,
+                                          CryptoUtil::buildDirProof(m_nId, pubKey),
+                                          QByteArray::fromBase64(selfSig.toLatin1()));
+    if (!sigOk) {
+        qWarning() << "[安全] 用户" << m_nId << "公钥自签名校验失败，拒绝登记";
+        resObj.insert("msg", QString("公钥自签名校验失败：无法证明你持有对应私钥"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
     if (!DataBaseMag::getInstance()->updateUserKeys(m_nId, pubKey)) {
         resObj.insert("msg", QString("密钥保存失败"));
         SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
@@ -536,18 +625,62 @@ void ClientSocket::ParseGetPubKey(const QJsonValue &dataVal)
     }
 
     QJsonObject keys;
+    QJsonObject sigs;
+    const QString spub  = serverPubPem();
+    const QString spriv = serverPrivPem();
     int missing = 0;
+
+    // 单次最多 200 条，且去重：公钥本身是公开信息，但没必要让人一次拉走整张表
+    QList<int> unique;
+    QSet<int> seen;
     foreach (int uid, ids) {
+        if (uid <= 0 || seen.contains(uid)) continue;
+        seen.insert(uid);
+        unique.append(uid);
+    }
+    if (unique.size() > 200) {
+        qWarning() << "[安全] 用户" << m_nId << "一次请求" << unique.size() << "个公钥，已拒绝";
+        QJsonObject resObj;
+        resObj.insert("msg", QString("一次最多查询 200 个公钥"));
+        SltSendMessage(KeyOperateFailed, QJsonValue(resObj));
+        return;
+    }
+
+    foreach (int uid, unique) {
         if (uid <= 0) continue;
         const QString pem = db->getUserPubKey(uid);
         if (pem.isEmpty()) { ++missing; continue; }
         keys.insert(QString::number(uid), pem);
+
+        // 每条目录项都由服务器签名，客户端据此排除"目录被替换"
+        if (!spriv.isEmpty()) {
+            QByteArray sig;
+            if (CryptoUtil::signDetached(spriv, CryptoUtil::buildDirProof(uid, pem), &sig))
+                sigs.insert(QString::number(uid), QString::fromLatin1(sig.toBase64()));
+        }
     }
 
     QJsonObject resObj;
     resObj.insert("keys", keys);
+    resObj.insert("sigs", sigs);
+    resObj.insert("spub", spub);
     resObj.insert("missing", missing);
     SltSendMessage(PubKeyData, QJsonValue(resObj));
+}
+
+void ClientSocket::writeFrame(const QByteArray &payload)
+{
+    if (!m_tcpSocket->isOpen() || payload.isEmpty()) return;
+
+    // 统一用 4 字节大端长度头，防粘包；握手帧和密文帧走同一条通道
+    const quint32 dataLen = static_cast<quint32>(payload.size());
+    QByteArray lenBytes(4, 0);
+    lenBytes[0] = static_cast<char>((dataLen >> 24) & 0xFF);
+    lenBytes[1] = static_cast<char>((dataLen >> 16) & 0xFF);
+    lenBytes[2] = static_cast<char>((dataLen >> 8) & 0xFF);
+    lenBytes[3] = static_cast<char>(dataLen & 0xFF);
+
+    m_tcpSocket->write(lenBytes + payload);
 }
 
 void ClientSocket::SltSendMessage(const quint8 &type, const QJsonValue &jsonVal)
@@ -555,32 +688,40 @@ void ClientSocket::SltSendMessage(const quint8 &type, const QJsonValue &jsonVal)
     if (!m_tcpSocket->isOpen()) return;
 
     // 构建 Json 对象
+    //
+    // 这里原本还有一句 jsonObj.insert("from", m_nId)，填的是**本连接的用户 id**，
+    // 既不是真正的发送者（发给 B 时填的是 B 自己的 id），客户端也从来没有读过它
+    // （全工程 grep 不到 ["from"]）。留着只有副作用：每条报文（包括心跳）都带一个
+    // 明文 uid，控制台一打印就把身份泄了。直接去掉。
     QJsonObject jsonObj;
     jsonObj.insert("type", type);
-    jsonObj.insert("from", m_nId);
     jsonObj.insert("data", jsonVal);
 
-    // 构建 Json 文档
     QJsonDocument document;
     document.setObject(jsonObj);
-    QByteArray jsonData = document.toJson(QJsonDocument::Compact);
-    // 图片消息是大包，日志只留摘要
-    if (jsonData.size() <= 512)
-        qDebug() << "服务器发送消息：" << jsonData;
-    else
-        qDebug() << "服务器发送消息：大包" << jsonData.size() << "字节 type" << type;
+    const QByteArray plain = document.toJson(QJsonDocument::Compact);
 
-    //防止粘包
-    quint32 dataLen = static_cast<quint32>(jsonData.size());
-    QByteArray lenBytes;
-    lenBytes.resize(4);
-    lenBytes[0] = (dataLen >> 24) & 0xFF;
-    lenBytes[1] = (dataLen >> 16) & 0xFF;
-    lenBytes[2] = (dataLen >> 8) & 0xFF;
-    lenBytes[3] = dataLen & 0xFF;
-    QByteArray sendData = lenBytes + jsonData;
+    // 协议 v2：握手没完成就一个字节业务数据都不发。
+    // 宁可让调用方"没收到回执"，也不能把明文吐到网络上。
+    if (!isSecure()) {
+        qWarning() << "[安全] 链路尚未加密，丢弃待发报文 type =" << type;
+        return;
+    }
 
-    m_tcpSocket->write(sendData);
+    // 日志脱敏：plain 是解密后的完整明文（含收件人、消息体），
+    // 打到控制台等于把"谁发给谁、发了什么"记在服务器本地。只留类型、长度和摘要，
+    // 出了问题用摘要对得上就行，不需要留全文。
+    qDebug() << "服务器发送 type" << type << "大小" << plain.size()
+             << "摘要" << QString::fromLatin1(CryptoUtil::sha256(plain).toHex().left(16));
+
+    QString err;
+    const QByteArray sealed = m_channel->seal(plain, &err);
+    if (sealed.isEmpty()) {
+        qWarning() << "[安全] 加密待发报文失败：" << err;
+        m_tcpSocket->abort();
+        return;
+    }
+    writeFrame(sealed);
 }
 
 void ClientSocket::SltConnected()
@@ -618,80 +759,260 @@ void ClientSocket::SltReadyRead()
         dataLen |= (static_cast<quint8>(m_recvBuffer[2]) << 8);
         dataLen |= static_cast<quint8>(m_recvBuffer[3]);
 
+        // 单帧上限 8 MiB：不校验的话，一个伪造的超大长度头会让缓冲区一直等到超时
+        if (dataLen > 8u * 1024u * 1024u) {
+            qWarning() << "[安全] 帧长度超限" << dataLen << "，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
         if (m_recvBuffer.size() < 4 + dataLen) {
             break; // 数据未收全，等待下次
         }
-        QByteArray jsonData = m_recvBuffer.mid(4, dataLen);
+        QByteArray frameBytes = m_recvBuffer.mid(4, dataLen);
         m_recvBuffer.remove(0, 4 + dataLen);
 
-        QJsonDocument doc = QJsonDocument::fromJson(jsonData);
-        if (doc.isObject()) {
-            QJsonObject jsonObj = doc.object();
-            quint8 nType = static_cast<quint8>(jsonObj["type"].toInt());            QString from = jsonObj["from"].toString();
-            QJsonValue dataVal = jsonObj["data"];
-
-            // 登录成功后身份以 socket 绑定的 id 为准，不再用包里的 from 覆盖：
-            // 否则客户端只要把 from 改成别人的 id，就能冒充他人发消息 / 操作群。
-            // 未登录（m_nId <= 0）时仍允许用它兜底，方便登录前的一些查询。
-            if (m_nId <= 0) {
-                m_nId = jsonObj["from"].toInt();
-            }
-
-            sendMsgType(nType,dataVal);
+        QJsonDocument doc = QJsonDocument::fromJson(frameBytes);
+        if (!doc.isObject()) {
+            qWarning() << "[协议] 收到非 JSON 帧，丢弃";
+            continue;
         }
+        const QJsonObject frame = doc.object();
+
+        // ---- 握手阶段：明文帧，只认带 hs 的报文 ----
+        if (frame.contains("hs")) {
+            QByteArray reply;
+            QString err;
+            if (!m_channel->handleHandshake(frame, &reply, &err)) {
+                qWarning() << "[握手] 处理失败：" << err;
+                m_tcpSocket->abort();
+                return;
+            }
+            if (!reply.isEmpty()) writeFrame(reply);
+            continue;
+        }
+
+        // ---- 数据面：没握手就没资格发业务帧 ----
+        if (!m_channel->isReady()) {
+            qWarning() << "[安全] 未完成握手的连接直接发业务帧，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
+        QByteArray plain;
+        QString err;
+        if (!m_channel->open(frame, &plain, &err)) {
+            qWarning() << "[安全] 链路帧解密失败：" << err << "；断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
+        const QJsonDocument inner = QJsonDocument::fromJson(plain);
+        if (!inner.isObject()) continue;
+
+        const QJsonObject jsonObj = inner.object();
+        const quint8 nType = static_cast<quint8>(jsonObj["type"].toInt());
+        const QJsonValue dataVal = jsonObj["data"];
+
+        // 协议 v2：身份只来自登录绑定的连接，报文里任何自称一律不认。
+        // 未认证的连接只允许「注册 / 登录」两种报文，其余立即断开，
+        // 否则任何人发一包 body 就能以别人的身份操作。
+        if (m_nId <= 0 && nType != Login && nType != Register) {
+            qWarning() << "[安全] 未认证连接发送业务报文 type =" << nType << "，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
+        sendMsgType(nType, dataVal);
     }
 
 
 }
 
+/**
+ * @brief ClientSocket::ParseLogin
+ * 协议 v2 的登录分两步走：
+ *   ① 客户端只报用户名 -> 服务端回 salt / 迭代次数 / 一次性 nonce（挑战）
+ *   ② 客户端用 PBKDF2 派生的 verifier 算 HMAC 证明（应答）
+ * 口令原文永远不出客户端，链路上连哈希都不传，只有一次一用的 proof。
+ */
 void ClientSocket::ParseLogin(const QJsonValue &dataVal)
 {
-    if(dataVal.isObject()){
-        QJsonObject dataObj = dataVal.toObject();
-        QString strName = dataObj.value("name").toString();
-        QString strPwd = dataObj.value("passwd").toString();
-        //        qDebug() << "登录" << strName << strPwd;
-        QJsonObject jsonObj = DataBaseMag::getInstance()->userLogin(strName, strPwd);
+    if (!dataVal.isObject()) return;
 
-        m_nId = jsonObj.value("id").toInt();
+    const QJsonObject dataObj = dataVal.toObject();
+    if (dataObj.value("step").toString() == QLatin1String("proof")) {
+        ParseLoginProof(dataObj);
+        return;
+    }
+    ParseLoginInit(dataObj);
+}
 
-        QString msg = jsonObj.value("msg").toString();
+void ClientSocket::ParseLoginInit(const QJsonObject &dataObj)
+{
+    const QString name = dataObj.value("name").toString().trimmed();
+    if (name.isEmpty()) {
+        QJsonObject err;
+        err.insert("msg", QStringLiteral("noneUser"));
+        SltSendMessage(LoginPasswdError, QJsonValue(err));
+        return;
+    }
 
-        // 数据库记着"在线"，但连接表里根本没有这个人 —— 说明上次是异常退出
-        // （进程被杀/断网），状态没被回收。这种脏数据不能把用户永远挡在门外。
-        if (msg == "OnLine") {
-            const int realId = jsonObj.value("realId").toInt();
-            TcpMsgServer *srv = TcpMsgServer::instance();
-            const bool actuallyOnline = srv && srv->isUserOnline(realId);
-            if (realId > 0 && !actuallyOnline) {
-                qInfo() << "[登录] 用户" << realId << "数据库状态为在线但无实际连接，按离线放行";
-                DataBaseMag::getInstance()->UpdateUserStatus(realId, OnLine);
-                jsonObj.insert("id", realId);
-                jsonObj.insert("msg", "ok");
-                m_nId = realId;
-                msg = "ok";
+    int uid = -1;
+    int iter = 0;
+    QByteArray salt, verifier;
+    const bool exists = DataBaseMag::getInstance()->authParams(name, &uid, &salt, &iter, &verifier);
+
+    if (!exists) {
+        // 用户名不存在时也给一个"稳定的假盐"：同一个名字每次挑战拿到同样的盐，
+        // 攻击者没法靠"盐变来变去"判断这个号到底有没有注册过。
+        salt = CryptoUtil::sha256(QByteArray("MC2/dummy-salt") + name.toUtf8()).left(16);
+        iter = 100000;
+        uid = -1;
+        verifier.clear();
+    }
+
+    if (!CryptoUtil::random(32, &m_authNonce)) {
+        QJsonObject err;
+        err.insert("msg", QStringLiteral("noneUser"));
+        SltSendMessage(LoginPasswdError, QJsonValue(err));
+        return;
+    }
+
+    m_authName     = name;
+    m_authUid      = uid;
+    m_authSalt     = salt;
+    m_authVerifier = verifier;
+
+    QJsonObject out;
+    out.insert("step", QStringLiteral("challenge"));
+    out.insert("alg", QStringLiteral("PBKDF2-SHA256"));
+    out.insert("salt", QString::fromLatin1(salt.toBase64()));
+    out.insert("iter", iter);
+    out.insert("nonce", QString::fromLatin1(m_authNonce.toBase64()));
+    SltSendMessage(Login, QJsonValue(out));
+}
+
+void ClientSocket::ParseLoginProof(const QJsonObject &dataObj)
+{
+    const QString name = dataObj.value("name").toString().trimmed();
+
+    // 没先要挑战、或名字与挑战时不一致：直接拒，不泄露"这个号存不存在"
+    if (m_authNonce.isEmpty() || name != m_authName) {
+        QJsonObject err;
+        err.insert("msg", QStringLiteral("noneUser"));
+        SltSendMessage(LoginPasswdError, QJsonValue(err));
+        return;
+    }
+
+    if (authLocked(name)) {
+        qWarning() << "[认证] 用户" << name << "连续失败次数过多，暂时锁定";
+        QJsonObject err;
+        err.insert("msg", QStringLiteral("locked"));
+        SltSendMessage(LoginPasswdError, QJsonValue(err));
+        m_authNonce.clear();
+        return;
+    }
+
+    const QByteArray sid = m_channel ? m_channel->sessionId() : QByteArray();
+
+    // proof = HMAC(verifier, "MC2/AUTH" ‖ sid ‖ nonce ‖ name)
+    // sid 把证明绑死在这条链路上：换一条连接重放旧 proof 必然失败
+    QByteArray material("MC2/AUTH", 8);
+    material.append(sid);
+    material.append(m_authNonce);
+    material.append(name.toUtf8());
+
+    const QByteArray want = CryptoUtil::hmacSha256(m_authVerifier, material);
+    const QByteArray got  = QByteArray::fromBase64(dataObj.value("proof").toString().toLatin1());
+
+    bool ok = !m_authVerifier.isEmpty() && !got.isEmpty()
+            && CryptoUtil::constantTimeEquals(got, want);
+    bool keyMismatch = false;
+
+    // 若库里登记过身份公钥，再验一次私钥签名：
+    // 这样即使数据库泄露（攻击者拿到 verifier 能自己算 proof），
+    // 没有本机私钥依然进不来。首次登录尚未上传公钥时只验口令。
+    if (ok && m_authUid > 0) {
+        const QString pub = DataBaseMag::getInstance()->getUserPubKey(m_authUid);
+        if (!pub.isEmpty()) {
+            QByteArray idInput("MC2/AUTH-ID", 11);
+            idInput.append(sid);
+            idInput.append(m_authNonce);
+            idInput.append(name.toUtf8());
+
+            const QByteArray sig = QByteArray::fromBase64(dataObj.value("sig").toString().toLatin1());
+            if (sig.isEmpty() || !CryptoUtil::verifyDetached(pub, idInput, sig)) {
+                qWarning() << "[认证] 用户" << name << "身份私钥签名校验失败"
+                           << "（本机密钥与服务端登记不一致，可能换过机器或重装过）";
+                ok = false;
+                keyMismatch = true;
             }
         }
+    }
 
-        if (m_nId > 0) emit signalConnected();
+    // nonce 一次一用：无论成败立即作废，旧 proof 再送进来也对不上
+    m_authNonce.clear();
 
-        if(msg == "ok"){  //不在线
-            SltSendMessage(LoginSuccess, jsonObj);
+    if (!ok) {
+        authNoteFailure(name);
+        QJsonObject err;
+        err.insert("msg", keyMismatch ? QStringLiteral("keyMismatch")
+                                      : QStringLiteral("noneUser"));
+        SltSendMessage(LoginPasswdError, QJsonValue(err));
+        return;
+    }
 
-            // 服务器不下发任何密钥材料：端到端加密要求服务器零知识，
-            // 它只保管用户公钥，永远不持有能解开正文的私钥。
-            emit signalLoginSuccess(this,QString::number(m_nId));
-            qDebug() << "登陆成功" << dataVal;
+    authNoteSuccess(name);
+    qInfo() << "[认证] 用户" << name << "挑战-应答通过，uid =" << m_authUid;
 
-            SltSendMessage(GetMyFriends,DataBaseMag::getInstance()->getMyFriends(m_nId));
-            SltSendMessage(GetMyGroups, DataBaseMag::getInstance()->getMyGroup(m_nId));
-            return;
-        }else if(msg == "OnLine"){
-            SltSendMessage(LoginRepeat, jsonObj);
-        }else{
-            SltSendMessage(LoginPasswdError, jsonObj);
+    const int uid = m_authUid;
+    m_authVerifier.clear();
+    m_authSalt.clear();
+    m_authUid = -1;
+
+    completeLogin(DataBaseMag::getInstance()->loginResultById(uid));
+}
+
+void ClientSocket::completeLogin(QJsonObject jsonObj)
+{
+    m_nId = jsonObj.value("id").toInt();
+
+    QString msg = jsonObj.value("msg").toString();
+
+    // 数据库记着"在线"，但连接表里根本没有这个人 —— 说明上次是异常退出
+    // （进程被杀/断网），状态没被回收。这种脏数据不能把用户永远挡在门外。
+    if (msg == "OnLine") {
+        const int realId = jsonObj.value("realId").toInt();
+        TcpMsgServer *srv = TcpMsgServer::instance();
+        const bool actuallyOnline = srv && srv->isUserOnline(realId);
+        if (realId > 0 && !actuallyOnline) {
+            qInfo() << "[登录] 用户" << realId << "数据库状态为在线但无实际连接，按离线放行";
+            DataBaseMag::getInstance()->UpdateUserStatus(realId, OnLine);
+            jsonObj.insert("id", realId);
+            jsonObj.insert("msg", "ok");
+            m_nId = realId;
+            msg = "ok";
         }
+    }
 
+    if (m_nId > 0) emit signalConnected();
+
+    if (msg == "ok") {  //不在线
+        SltSendMessage(LoginSuccess, jsonObj);
+
+        // 服务器不下发任何密钥材料：端到端加密要求服务器零知识，
+        // 它只保管用户公钥，永远不持有能解开正文的私钥。
+        emit signalLoginSuccess(this, QString::number(m_nId));
+        qDebug() << "登陆成功 uid =" << m_nId;
+
+        SltSendMessage(GetMyFriends, DataBaseMag::getInstance()->getMyFriends(m_nId));
+        SltSendMessage(GetMyGroups, DataBaseMag::getInstance()->getMyGroup(m_nId));
+        return;
+    } else if (msg == "OnLine") {
+        SltSendMessage(LoginRepeat, jsonObj);
+    } else {
+        SltSendMessage(LoginPasswdError, jsonObj);
     }
 }
 
@@ -1072,9 +1393,20 @@ void ClientSocket::ParseSendMsg(const QJsonValue &dataVal)
     QJsonObject jsonObj = dataVal.toObject();
     const int targetId = jsonObj.value("id").toInt();
 
+    // 授权校验：只能给好友发消息。缺了这一步，任何登录用户都能骚扰任何人。
+    if (targetId <= 0 || !DataBaseMag::getInstance()->isFriendById(m_nId, targetId)) {
+        qWarning() << "[授权] 用户" << m_nId << "试图向非好友" << targetId << "发送消息，已拒绝";
+        QJsonObject rej;
+        rej.insert("key", jsonObj.value("key").toString());
+        rej.insert("msg", QString("对方不是你的好友，消息未发送"));
+        SltSendMessage(SendRejected, QJsonValue(rej));
+        return;
+    }
+
     QJsonObject resObj;
-    resObj.insert("id", m_nId);
-    // id 换成发送者，其余字段（msg/type/color/size/enc）一律原样透传。
+    // v3：不再往转发报文里写发送者 uid。接收方从密文里解出身份，
+    // 服务器写了也没意义（明文、可改、客户端也会覆盖），只会把身份泄在链路上。
+    // 其余字段（msg/type/color/size/enc）仍一律原样透传。
     // 少带 type 接收端就会把图片当文字渲染成 base64，少带 color 自定义颜色也会丢。
     for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
     {
@@ -1086,7 +1418,8 @@ void ClientSocket::ParseSendMsg(const QJsonValue &dataVal)
 
 //    qDebug() << "发送的head" <<  DataBaseMag::getInstance()->getUserHead(m_nId) << "\n";
 
-    // 审计日志：只记录密文，管理员需要时再用托管私钥解密
+    // 审计日志：整包原样落库。msg 字段是 v3 信封（hdr/iv/ct/tag/eks/sig），
+    // 正文与收发双方 uid 都在密文里，服务器没有私钥，任何一天也解不开。
     // 这里记录的是消息类型（Text/Face/Files…），不是协议类型
     const quint8 msgType = static_cast<quint8>(jsonObj.value("type").toInt());
     DataBaseMag::getInstance()->insertMsgLog(
@@ -1110,7 +1443,7 @@ void ClientSocket::ParseSendFace(const QJsonValue &dataVal)
     // 原样透传（跳过 id/to，id 换成发送者），不要再手工重建 JSON：
     // key 是撤回时定位消息的唯一标识，丢了它对方就撤不掉；color/size 等同理。
     QJsonObject resObj;
-    resObj.insert("id", m_nId);
+    // 同上：发送者 uid 走密文，报文里不再出现
     for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
     {
         const QString key = it.key();
@@ -1135,7 +1468,7 @@ void ClientSocket::ParseSendFile(const QJsonValue &dataVal)
 
     // 同样整包透传：key（撤回定位）、size、type 一次带齐
     QJsonObject resObj;
-    resObj.insert("id", m_nId);
+    // 同上：发送者 uid 走密文，报文里不再出现
     for (auto it = jsonObj.constBegin(); it != jsonObj.constEnd(); ++it)
     {
         const QString key = it.key();
@@ -1203,8 +1536,19 @@ void ClientSocket::ParseSendGroupMsg(const QJsonValue &dataVal)
     if(type == Files) {
         groupId = jsonObj.value("to").toInt();
     }
+
+    // 授权校验：非群成员不能往群里发消息
+    if (groupId <= 0 || !DataBaseMag::getInstance()->isGroupMember(groupId, m_nId)) {
+        qWarning() << "[授权] 用户" << m_nId << "不是群" << groupId << "的成员，拒绝转发";
+        QJsonObject rej;
+        rej.insert("key", jsonObj.value("key").toString());
+        rej.insert("msg", QString("你不在该群聊中，消息未发送"));
+        SltSendMessage(SendRejected, QJsonValue(rej));
+        return;
+    }
+
     jsonObj.insert("head", DataBaseMag::getInstance()->getUserHead(m_nId));
-    jsonObj.insert("userId", m_nId);
+    // 发送者 uid 不再写进报文：接收端从密文里解出后自己填 userId
     jsonObj.insert("name", DataBaseMag::getInstance()->getUsernameFromId(QString::number(m_nId)));
     qDebug() << type;
 

@@ -115,6 +115,29 @@ MainWindow::MainWindow(QWidget *parent) :
     m_nFilePort(60102)
 {
     ui->setupUi(this);
+
+    /*
+     * 界面自身的开销节流。
+     * 压测时暴露出来的瓶颈不在网络层，而在 GUI 线程：
+     *   1) 每条日志都 textBrowser->append()，文档无上限增长，越写越慢；
+     *   2) 每条日志还顺手更新一次托盘提示，那是 Win32 的 Shell_NotifyIcon 调用；
+     *   3) 每次连接数变化都重建整张用户表（遍历全部用户 + 逐条读头像文件）。
+     * 几百个连接时这三件事叠加，accept 与握手只能排队，客户端表现为 ECONNREFUSED。
+     */
+    ui->textBrowser->document()->setMaximumBlockCount(2000);
+
+    m_logFlushTimer = new QTimer(this);
+    m_logFlushTimer->setSingleShot(true);
+    m_logFlushTimer->setInterval(100);
+    connect(m_logFlushTimer, &QTimer::timeout, this, &MainWindow::flushLogs);
+
+    m_userTableTimer = new QTimer(this);
+    m_userTableTimer->setSingleShot(true);
+    m_userTableTimer->setInterval(600);
+    connect(m_userTableTimer, &QTimer::timeout, this, &MainWindow::flushUserTableRefresh);
+    m_bUserTableDirty = false;
+    m_msLastTrayTip = 0;
+
     // 无边框窗口默认是 WS_POPUP 且不带 WS_MINIMIZEBOX，Windows 会认为它不可最小化，
     // 点任务栏图标毫无反应。这里显式声明“可最小化 + 系统菜单”，
     // 才能在任务栏图标上单击最小化/还原（界面依旧无边框，由自绘标题栏控制）。
@@ -352,6 +375,13 @@ void MainWindow::hideToTray()
 void MainWindow::updateTrayTip()
 {
     if (!m_tray) return;
+
+    // 每次 setToolTip 都是一次 Win32 Shell_NotifyIcon 调用，压测时每秒几百次会直接卡住 GUI 线程。
+    // 托盘提示本来就是给人看的，1 秒粒度足够。
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_msLastTrayTip < 1000) return;
+    m_msLastTrayTip = now;
+
     m_tray->setToolTip(QString("局域网通信服务器\n消息端口 %1 · 文件端口 %2\n在线用户 %3 人")
                        .arg(m_nMsgPort)
                        .arg(m_nFilePort)
@@ -485,17 +515,50 @@ void MainWindow::refreshRuntimeInfo()
 void MainWindow::appendLog(const QString &text, const QString &color)
 {
     if (!ui || !ui->textBrowser) return;
-    const QString html = QString("<div style='color:%1;'>[%2] %3</div>")
+
+    m_pendingLogs.append(QString("<div style='color:%1;'>[%2] %3</div>")
             .arg(color,
                  QDateTime::currentDateTime().toString("HH:mm:ss"),
-                 text.toHtmlEscaped());
+                 text.toHtmlEscaped()));
+    // 极端情况下（疯狂刷日志）不让队列无限涨，丢最老的
+    while (m_pendingLogs.size() > 5000) m_pendingLogs.removeFirst();
+
+    // 100ms 内的日志合并成一次 append：一次重排胜过几百次
+    if (m_logFlushTimer && !m_logFlushTimer->isActive())
+        m_logFlushTimer->start();
+}
+
+void MainWindow::flushLogs()
+{
+    if (!ui || !ui->textBrowser || m_pendingLogs.isEmpty()) return;
+
+    const QString html = m_pendingLogs.join(QString());
+    m_pendingLogs.clear();
     ui->textBrowser->append(html);
+    updateTrayTip();
+}
+
+void MainWindow::scheduleUserTableRefresh()
+{
+    m_bUserTableDirty = true;
+    // 600ms 内的多次变化（比如批量上线）合并成一次重建
+    if (m_userTableTimer && !m_userTableTimer->isActive())
+        m_userTableTimer->start();
+}
+
+void MainWindow::flushUserTableRefresh()
+{
+    if (!m_bUserTableDirty) return;
+    // 用户管理页没在前台就直接跳过。整表重建要遍历所有用户、逐条加载头像，
+    // 压测时几百个连接来回上下线，重建一次就是几百次磁盘读，白烧 GUI 线程。
+    if (!ui || ui->stackedWidgetFunc->currentIndex() != 3) return;
+    refreshUserTable();
 }
 
 void MainWindow::sltServerLog(const QString &text)
 {
+    // 托盘提示改由 flushLogs 统一触发（已限频），这里不再每条都调
     appendLog(text, QStringLiteral("#444444"));
-    updateTrayTip();
 }
 
 void MainWindow::sltClientChanged(int online, int sockets)
@@ -505,7 +568,7 @@ void MainWindow::sltClientChanged(int online, int sockets)
     updateTrayTip();
     refreshRuntimeInfo();
     if (m_bLoggedIn) {
-        refreshUserTable();   // 在线状态列实时变化
+        scheduleUserTableRefresh();   // 在线状态列要刷新，但合并成 600ms 一次
     }
 }
 
@@ -743,6 +806,7 @@ void MainWindow::initUserTable()
 void MainWindow::refreshUserTable()
 {
     if (!m_userModel) return;
+    m_bUserTableDirty = false;
 
     m_userModel->clear();
     m_userModel->setHorizontalHeaderLabels(QStringList()
@@ -1219,9 +1283,11 @@ void MainWindow::initAuditPage()
     root->addLayout(bar);
 
     // ---- 说明 ----
-    QLabel *tip = new QLabel("客户端之间用 AES-256-GCM 加密正文，AES 密钥再用各自 RSA 公钥包裹。"
+    QLabel *tip = new QLabel("客户端之间用 AES-256-GCM 加密正文，收发双方的 uid 一起进入密文，"
+                             "AES 密钥再用各收件人的 RSA 公钥分别包裹（v3 起不标归属）。"
                              "服务器和数据库里只有密文，且不持有任何私钥——即使拿到整台服务器，"
-                             "也无法还原任何一条消息的内容。这里能看到的是加密后的报文与收发元数据。");
+                             "也无法还原任何一条消息的内容与发送者。"
+                             "这里能看到的是加密后的报文，以及投递所必需的链路元数据。");
     tip->setWordWrap(true);
     tip->setStyleSheet("color:#8A96A3;font-size:12px;background:#F7FAFD;border:1px solid #E4EBF3;"
                        "border-radius:4px;padding:6px 8px;");
@@ -1291,18 +1357,21 @@ void MainWindow::refreshAuditTable()
         const QVariantMap &row = rows.at(i);
         const QJsonObject obj = QJsonDocument::fromJson(row.value("payload").toString().toUtf8()).object();
         const QString rawMsg = obj.value("msg").toString();
-        const bool encrypted = (obj.value("enc").toInt() != 0) && CryptoUtil::isPacket(rawMsg);
+        // 以报文本身为准：v3 信封（v:3 + hdr + ct/tag + eks 数组 + sig）就是密文，
+        // 不能再依赖客户端声称的 enc 标记，更不能拿 v2 的 "alg" 字段当判据。
+        const bool encrypted = CryptoUtil::isPacket(rawMsg);
 
         QString content;
         QString state;
         if (encrypted) {
             ++encCount;
             content = rawMsg;
-            // 服务器能看到的极限：这份密文是用哪几个人的公钥分别包裹过密钥的。
+            // 服务器能看到的极限：这份密文给几个人各包了一份密钥。
             // 至于正文，没有对应私钥就永远打不开——本程序里也不存在任何私钥副本。
-            const QList<int> rcpt = CryptoUtil::packetRecipients(rawMsg);
-            state = rcpt.isEmpty() ? QStringLiteral("端到端加密")
-                                   : QStringLiteral("端到端加密·%1份密钥").arg(rcpt.size());
+            // v3 起 eks 不再标 uid，所以只报份数，不报是谁。
+            const int keyCount = CryptoUtil::packetKeyCount(rawMsg);
+            state = keyCount > 0 ? QStringLiteral("端到端加密·%1份密钥").arg(keyCount)
+                                 : QStringLiteral("端到端加密");
         } else {
             ++plainCount;
             content = rawMsg;
@@ -1345,10 +1414,12 @@ void MainWindow::refreshAuditTable()
         }
         m_msgTable->setItem(r, 3, new QTableWidgetItem(typeName));
 
-        // 内容：密文不可读，只给出长度和算法；完整报文放 tooltip，便于演示"服务器只看到密文"
+        // 内容：密文不可读，只给出真实密文长度；完整报文放 tooltip，便于演示"服务器只看到密文"
         QString preview;
         if (encrypted) {
-            preview = QStringLiteral("[密文 %1 字节 · AES-256-GCM]").arg(rawMsg.size());
+            const QJsonObject env = QJsonDocument::fromJson(rawMsg.toUtf8()).object();
+            const int ctBytes = QByteArray::fromBase64(env.value("ct").toString().toLatin1()).size();
+            preview = QStringLiteral("[密文 %1 字节 · AES-256-GCM]").arg(ctBytes > 0 ? ctBytes : rawMsg.size());
         } else {
             preview = content;
             preview.replace('\n', ' ');

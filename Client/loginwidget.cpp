@@ -3,8 +3,10 @@
 #include "mainwindow.h"
 #include "netdb/mysocket.h"
 #include "netdb/databasemsg.h"
+#include "netdb/keystore.h"
 #include "comapi/myapp.h"
 #include "comapi/unit.h"
+#include "comapi/cryptoutil.h"
 #include <comapi/global.h>
 
 #include <QMessageBox>
@@ -33,7 +35,10 @@ LoginWidget::LoginWidget(QWidget *parent) :
     setWindowFlags(Qt::FramelessWindowHint
                    | Qt::WindowMinimizeButtonHint
                    | Qt::WindowSystemMenuHint);
-    MyApp::InitApp(".");
+    // 数据目录必须锚定在 exe 所在目录，不能用 "."：
+    // 从快捷方式/命令行/别的目录启动时工作目录不一定是程序目录，
+    // 那样 Data 会被建到别处（聊天记录、密钥全跑到意外位置）。
+    MyApp::InitApp(QCoreApplication::applicationDirPath());
     m_tcpSocket = new MySocket(this);
     connect(m_tcpSocket,&MySocket::signalStatus,this,&LoginWidget::sltStatus);
     connect(m_tcpSocket,&MySocket::signalConnectSuccess,this,&LoginWidget::sltConnectSuccess);
@@ -226,7 +231,22 @@ void LoginWidget::sltStatus(const quint8 &status, const QJsonValue &dataVal)
     }
     case LoginPasswdError:
     {
-        QMessageBox::warning(this,"登录","用户名或密码错误");
+        // 服务端为了不泄露"账号是否存在"，统一回 noneUser；
+        // 但另两种原因必须分开讲，否则用户永远以为是口令打错了：
+        //   keyMismatch —— 本机私钥与账号登记的公钥对不上（换机、重装、多份运行目录各生成了一套密钥）
+        //   locked      —— 连续失败触发了 5 分钟锁定
+        const QString why = dataVal.isObject()
+                ? dataVal.toObject().value("msg").toString() : QString();
+        if (why == QLatin1String("keyMismatch")) {
+            QMessageBox::warning(this, "登录",
+                "本机身份密钥与账号记录不一致。\n\n"
+                "若确实是本人在登录，请联系管理员执行：\n"
+                "UPDATE USERINFO SET pub_key='' WHERE name='<账号>';");
+        } else if (why == QLatin1String("locked")) {
+            QMessageBox::warning(this, "登录", "失败次数过多，请 5 分钟后再试。");
+        } else {
+            QMessageBox::warning(this, "登录", "用户名或密码错误");
+        }
         break;
     }
     case RegisterOk:
@@ -273,11 +293,15 @@ void LoginWidget::on_btnLogin_clicked()     //登录
         return;
     }
 
-    QJsonObject json;
-    json.insert("name",ui->lineEditUser->text());
-    json.insert("passwd",ui->lineEditPasswd->text());
-    m_tcpSocket->sendMessage(Login, json);
+    // 登录前就把本机身份密钥准备好：挑战-应答要提交身份私钥签名。
+    // 密钥只在本机生成，私钥永不出本机。
+    const QString name = ui->lineEditUser->text().trimmed();
+    if (KeyStore::instance()->ensureLocalKeys(name, 0).isEmpty()) {
+        qWarning() << "[加密] 本机身份密钥初始化失败：" << CryptoUtil::lastError();
+    }
 
+    // 协议 v2：sendLogin 只发用户名，口令留在本机参与挑战-应答，不上网
+    m_tcpSocket->sendLogin(name, ui->lineEditPasswd->text());
 }
 
 void LoginWidget::on_btnReister_clicked()   //注册

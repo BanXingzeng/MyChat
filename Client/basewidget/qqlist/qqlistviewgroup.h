@@ -38,7 +38,7 @@ public:
     Ui::QQListViewGroup *ui;
 
 private:
-    QQCell *cell;
+    QQCell *cell = nullptr;
 };
 
 #endif // QQLISTVIEWGROUP_H

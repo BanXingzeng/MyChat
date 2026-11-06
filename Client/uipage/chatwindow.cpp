@@ -275,7 +275,11 @@ void ChatWindow::AddMessage(const QJsonValue &jsonVal) // 接收消息
         type = Picture;
     }
     if(type == Face && getIsGroup()) {
-        msg = QString::number(jsonObj.value("msg").toInt());
+        // msg 是解密出来的下标字符串（"74"）。这里必须走 QString::toInt()：
+        // QJsonValue::toInt() 只认 JSON 数字，遇到字符串一律返回 0，
+        // 用它取值会让群表情在接收方永远显示第 1 张（下标 0）。
+        const QJsonValue faceVal = jsonObj.value("msg");
+        msg = QString::number(faceVal.isDouble() ? faceVal.toInt() : msg.toInt());
     }
     QString userName = jsonObj.value("name").toString();
     QString head = jsonObj.value("head").toString();
@@ -1523,6 +1527,18 @@ void ChatWindow::onSendAck(const QString &msgKey)
     m_pendingDeadline.remove(msgKey);
     m_pendingPayloads.remove(msgKey);
     ui->widgetBubble->setItemSendState(msgKey, SendDone);
+}
+
+/**
+ * @brief ChatWindow::failSendByKey
+ * 服务端明确拒绝转发（不是好友 / 不在群里）：立刻标红，不要等超时
+ */
+void ChatWindow::failSendByKey(const QString &msgKey)
+{
+    if (msgKey.isEmpty()) return;
+
+    m_pendingDeadline.remove(msgKey);
+    ui->widgetBubble->setItemSendState(msgKey, SendFailed);
 }
 
 /**

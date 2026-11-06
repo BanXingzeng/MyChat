@@ -1,10 +1,16 @@
 #include "mysocket.h"
+#include "handshake.h"
+#include "keystore.h"
 #include <QJsonObject>
 #include <qjsondocument.h>
 #include <QHostAddress>
 #include <QTimer>
 #include "comapi/unit.h"
 #include <comapi/myapp.h>
+#include <comapi/cryptoutil.h>
+
+static QString b64(const QByteArray &raw) { return QString::fromLatin1(raw.toBase64()); }
+static QByteArray unb64(const QString &text) { return QByteArray::fromBase64(text.toLatin1()); }
 
 MySocket::MySocket(QObject *parent)
 {
@@ -20,6 +26,22 @@ MySocket::MySocket(QObject *parent)
     m_reconnectTimer = new QTimer(this);
     m_reconnectTimer->setSingleShot(true);
     connect(m_reconnectTimer, &QTimer::timeout, this, &MySocket::sltReconnectTimeout);
+
+    // 协议 v2：链路加密通道。握手在 TCP 连上之后立刻开始，
+    // 完成之前业务报文只排队不发送——宁可慢一拍，也不让任何一个字节明文上网。
+    m_channel = new SecureChannel(SecureChannel::Client, this);
+    connect(m_channel, &SecureChannel::serverFingerprintLearned,
+            this, [](const QByteArray &fp, const QString &pem) {
+        // 首次连接：把服务器公钥固定下来（TOFU），之后每次都必须一致
+        if (KeyStore::instance()->pinServerKey(pem)) {
+            qInfo() << "[握手] 已固定服务器公钥，指纹" << fp.toHex().left(16);
+        }
+    });
+
+    m_hsTimer = new QTimer(this);
+    m_hsTimer->setSingleShot(true);
+    m_hsTimer->setInterval(8000);
+    connect(m_hsTimer, &QTimer::timeout, this, &MySocket::sltHandshakeTimeout);
 }
 
 MySocket::~MySocket()
@@ -141,11 +163,7 @@ void MySocket::sltReadyRead()
 {
     QByteArray newData = m_tcpSocket->readAll();
     m_recvBuffer.append(newData);
-    // 图片消息是 base64 内嵌的，整包可能几百 KB，日志里只留摘要
-    if (newData.size() <= 512)
-        qDebug() << "客户端收到消息：" << newData;
-    else
-        qDebug() << "客户端收到消息：大包" << newData.size() << "字节";
+
     while (true) {
         // 先检查是否够4字节长度头
         if (m_recvBuffer.size() < 4) {
@@ -158,22 +176,152 @@ void MySocket::sltReadyRead()
         dataLen |= (static_cast<quint8>(m_recvBuffer[2]) << 8);
         dataLen |= static_cast<quint8>(m_recvBuffer[3]);
 
+        // 单帧上限 8 MiB：不校验的话，一个伪造的超大长度头会让缓冲区一直等到超时
+        if (dataLen > 8u * 1024u * 1024u) {
+            qWarning() << "[安全] 帧长度超限" << dataLen << "，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
         if (m_recvBuffer.size() < 4 + dataLen) {
             break; // 数据未收全，等待下次
         }
-        QByteArray jsonData = m_recvBuffer.mid(4, dataLen);
+        QByteArray frameBytes = m_recvBuffer.mid(4, dataLen);
         m_recvBuffer.remove(0, 4 + dataLen);
 
-        QJsonDocument doc = QJsonDocument::fromJson(jsonData);
-        if (doc.isObject()) {
-            QJsonObject jsonObj = doc.object();
-            quint8 nType = jsonObj["type"].toInt();
-            QString from = jsonObj["from"].toString();
-            QJsonValue dataVal = jsonObj["data"];
+        QJsonDocument doc = QJsonDocument::fromJson(frameBytes);
+        if (!doc.isObject()) {
+            qWarning() << "[协议] 收到非 JSON 帧，丢弃";
+            continue;
+        }
+        const QJsonObject frame = doc.object();
 
-            sendMsgType(nType,dataVal);
+        // ---- 握手阶段：明文帧 ----
+        if (frame.contains("hs")) {
+            if (!handleHandshakeFrame(frame)) {
+                m_tcpSocket->abort();
+                return;
+            }
+            continue;
+        }
+
+        // ---- 数据面：没有加密通道就不接受任何业务数据 ----
+        if (!m_channel->isReady()) {
+            qWarning() << "[安全] 链路未加密却收到业务帧，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
+        QByteArray plain;
+        QString err;
+        if (!m_channel->open(frame, &plain, &err)) {
+            qWarning() << "[安全]" << err << "，断开";
+            m_tcpSocket->abort();
+            return;
+        }
+
+        const QJsonDocument inner = QJsonDocument::fromJson(plain);
+        if (!inner.isObject()) continue;
+
+        const QJsonObject jsonObj = inner.object();
+        const quint8 nType = static_cast<quint8>(jsonObj["type"].toInt());
+
+        // 日志只留类型、长度和摘要。解开链路后这里就是完整明文，
+        // 直接打到控制台等于把"谁发的、发了什么"写进本机日志文件。
+        qDebug() << "客户端收到 type" << nType << "大小" << plain.size()
+                 << "摘要" << QString::fromLatin1(CryptoUtil::sha256(plain).toHex().left(16));
+
+        sendMsgType(nType, jsonObj["data"]);
+    }
+}
+
+bool MySocket::handleHandshakeFrame(const QJsonObject &frame)
+{
+    QByteArray reply;
+    QString err;
+    if (!m_channel->handleHandshake(frame, &reply, &err)) {
+        qWarning() << "[握手]" << err;
+        emit signalConnectFailed(err);
+        return false;
+    }
+    if (!reply.isEmpty() && !writeFrame(reply)) return false;
+
+    if (m_channel->isReady()) {
+        m_hsTimer->stop();
+        qInfo() << "[握手] 链路已加密，可以开始业务通信";
+
+        // 排队等着的报文（登录请求往往就在里面）现在一次性发出去
+        flushOutQueue();
+
+        emit signalSecureReady();
+        emit signalConnectSuccess();
+
+        if (m_bWasReconnect) {
+            qInfo() << "[重连] 链路已恢复";
+            emit signalReconnected();
         }
     }
+    return true;
+}
+
+void MySocket::startHandshake()
+{
+    m_channel->reset();
+    // 已固定的服务器公钥 -> 指纹比对；为空说明是首次连接（TOFU）
+    const QString pinned = KeyStore::instance()->serverPubKey();
+    m_channel->setPinnedServerPublicKey(pinned);
+
+    const QByteArray ch = m_channel->clientHello();
+    if (ch.isEmpty() || !writeFrame(ch)) {
+        qWarning() << "[握手] 无法发起握手：" << m_channel->lastError();
+        emit signalConnectFailed(m_channel->lastError());
+        m_tcpSocket->abort();
+        return;
+    }
+    m_hsTimer->start();
+    qInfo() << "[握手] 已发出 CH" << (pinned.isEmpty() ? "（首次连接，将固定服务器指纹）" : "");
+}
+
+void MySocket::flushOutQueue()
+{
+    if (!m_channel->isReady()) return;
+    while (!m_outQueue.isEmpty()) {
+        const QByteArray plain = m_outQueue.takeFirst();
+        QString err;
+        const QByteArray sealed = m_channel->seal(plain, &err);
+        if (sealed.isEmpty()) {
+            qWarning() << "[安全] 排队报文加密失败：" << err;
+            continue;
+        }
+        writeFrame(sealed);
+    }
+}
+
+bool MySocket::writeFrame(const QByteArray &payload)
+{
+    if (!m_tcpSocket->isOpen() || payload.isEmpty()) return false;
+
+    const quint32 dataLen = static_cast<quint32>(payload.size());
+    QByteArray lenBytes(4, 0);
+    lenBytes[0] = static_cast<char>((dataLen >> 24) & 0xFF);
+    lenBytes[1] = static_cast<char>((dataLen >> 16) & 0xFF);
+    lenBytes[2] = static_cast<char>((dataLen >> 8) & 0xFF);
+    lenBytes[3] = static_cast<char>(dataLen & 0xFF);
+
+    return m_tcpSocket->write(lenBytes + payload) > 0;
+}
+
+void MySocket::sltHandshakeTimeout()
+{
+    if (m_channel->isReady()) return;
+    qWarning() << "[握手] 8 秒内未完成，判定链路不可信，断开";
+    emit signalConnectFailed(tr("与服务器的加密握手超时，已断开"));
+    m_tcpSocket->abort();
+}
+
+bool MySocket::isSecure() const
+{
+    return m_channel && m_channel->isReady();
 }
 
 void MySocket::sltConnect()
@@ -186,19 +334,23 @@ void MySocket::sltConnect()
     qDebug() << "已连接服务器:" << m_tcpSocket->peerAddress().toString()
              << m_tcpSocket->peerPort();
 
-    const bool isReconnect = m_bConnectedOnce;   // 之前连上过 = 这次是恢复
+    m_bWasReconnect = m_bConnectedOnce;   // 之前连上过 = 这次是恢复
     m_bConnectedOnce = true;
 
-    emit signalConnectSuccess();
-    if (isReconnect) {
-        qInfo() << "[重连] 链路已恢复";
-        emit signalReconnected();
-    }
+    // 先握手，握手完成后才对外宣布"连上了"
+    startHandshake();
 }
 
 void MySocket::sltDisconnect()
 {
     qDebug() << "客户端断开连接";
+
+    // 旧会话的密钥与排队报文一律作废：重连后重新握手、重新登录
+    m_hsTimer->stop();
+    m_channel->reset();
+    m_outQueue.clear();
+    m_loginPasswd.clear();
+
     if (m_bManualClose || !m_bAutoReconnect) return;
     scheduleReconnect();
 }
@@ -222,45 +374,138 @@ void MySocket::sltError(QAbstractSocket::SocketError error)
 
 void MySocket::sendMessage(const quint8 &type, const QJsonValue &dataVal)
 {
-    // 连接服务器
-    if (!m_tcpSocket->isOpen()) {
-        m_tcpSocket->connectToHost(MyApp::m_strHostAddr, MyApp::m_nMsgPort);
-        m_tcpSocket->waitForConnected(1000);
-    }
-    // 超时1s后还是连接不上，直接返回
-    if (!m_tcpSocket->isOpen()) return;
     QJsonObject json;
     json.insert("type",type);
-    json.insert("from", MyApp::m_nId);
+    // 协议 v2：不再发送 from 字段。身份由登录绑定的连接决定，
+    // 客户端自报家门这条路径本身就是身份伪造的入口，直接砍掉。
     json.insert("data",dataVal);
 
     QJsonDocument document;
     document.setObject(json);
-    QByteArray jsonData = document.toJson(QJsonDocument::Compact);
+    const QByteArray plain = document.toJson(QJsonDocument::Compact);
+
     // 大包（图片）只打印摘要，避免日志被 base64 淹没
-    if (jsonData.size() <= 512)
-        qDebug() << "客户端发送消息：" << jsonData;
+    if (plain.size() <= 512)
+        qDebug() << "客户端发送（明文，仅本地日志）：" << plain;
     else
-        qDebug() << "客户端发送消息：大包" << jsonData.size() << "字节 type" << type;
+        qDebug() << "客户端发送：大包" << plain.size() << "字节 type" << type;
 
-    //防止粘包
-    quint32 dataLen = static_cast<quint32>(jsonData.size());
-    QByteArray lenBytes;
-    lenBytes.resize(4);
-    lenBytes[0] = (dataLen >> 24) & 0xFF;
-    lenBytes[1] = (dataLen >> 16) & 0xFF;
-    lenBytes[2] = (dataLen >> 8) & 0xFF;
-    lenBytes[3] = dataLen & 0xFF;
-    QByteArray sendData = lenBytes + jsonData;
+    // 没连上就先发起连接，报文排队等握手完成——不再阻塞事件循环等 TCP 连上，
+    // 否则握手报文在队列里排着，waitForConnected 只能干等到超时。
+    if (m_tcpSocket->state() == QAbstractSocket::UnconnectedState) {
+        connectToHost(MyApp::m_strHostAddr, MyApp::m_nMsgPort);
+    }
 
-    m_tcpSocket->write(sendData);
+    if (!m_channel->isReady()) {
+        if (m_outQueue.size() < 256) m_outQueue.append(plain);
+        else qWarning() << "[安全] 排队报文过多，丢弃最早的一条" << type;
+        return;
+    }
+
+    QString err;
+    const QByteArray sealed = m_channel->seal(plain, &err);
+    if (sealed.isEmpty()) {
+        qWarning() << "[安全] 加密待发报文失败：" << err;
+        return;
+    }
+    writeFrame(sealed);
+}
+
+/**
+ * @brief MySocket::sendLogin
+ * 第一步只发用户名。口令留在本机，等服务器把 salt/迭代次数/nonce 送过来再算证明。
+ */
+void MySocket::sendLogin(const QString &name, const QString &passwd)
+{
+    m_loginName = name;
+    m_loginPasswd = passwd;
+
+    QJsonObject json;
+    json.insert("name", name);
+    json.insert("step", QStringLiteral("init"));
+    sendMessage(Login, QJsonValue(json));
+}
+
+/**
+ * @brief MySocket::handleAuthChallenge
+ * 收到 0x11 Login 且 step == "challenge"：说明服务器在要口令证明。
+ * 算完立刻把口令从内存里抹掉，只保留这一次性的 proof。
+ */
+bool MySocket::handleAuthChallenge(const QJsonValue &dataVal)
+{
+    if (!dataVal.isObject()) return false;
+    const QJsonObject obj = dataVal.toObject();
+    if (obj.value("step").toString() != QLatin1String("challenge")) return false;
+
+    const QString alg = obj.value("alg").toString();
+    const QByteArray salt = unb64(obj.value("salt").toString());
+    const QByteArray nonce = unb64(obj.value("nonce").toString());
+    const int iter = obj.value("iter").toInt();
+
+    if (alg != QLatin1String("PBKDF2-SHA256") || salt.isEmpty() || nonce.size() != 32 || iter <= 0) {
+        qWarning() << "[认证] 服务器下发的挑战参数不合法";
+        emit signalStatus(LoginPasswdError, dataVal);
+        return true;
+    }
+    if (m_loginPasswd.isEmpty() || m_loginName.isEmpty()) {
+        qWarning() << "[认证] 没有待用的登录口令，忽略挑战";
+        return true;
+    }
+
+    // verifier 就是服务端存的 digest；两边算出来的必须一模一样
+    const QByteArray verifier = CryptoUtil::pbkdf2Sha256(m_loginPasswd.toUtf8(), salt, iter, 32);
+    if (verifier.isEmpty()) {
+        emit signalStatus(LoginPasswdError, dataVal);
+        return true;
+    }
+
+    const QByteArray sid = m_channel->sessionId();
+    QByteArray material("MC2/AUTH", 8);
+    material.append(sid);
+    material.append(nonce);
+    material.append(m_loginName.toUtf8());
+
+    QJsonObject out;
+    out.insert("name", m_loginName);
+    out.insert("step", QStringLiteral("proof"));
+    out.insert("proof", b64(CryptoUtil::hmacSha256(verifier, material)));
+
+    // 身份私钥签名：服务端登记过公钥时会验这一项，
+    // 这样即使数据库泄露（能算出 proof），没有本机私钥也进不去。
+    KeyStore *ks = KeyStore::instance();
+    if (ks->isReady()) {
+        QByteArray idInput("MC2/AUTH-ID", 11);
+        idInput.append(sid);
+        idInput.append(nonce);
+        idInput.append(m_loginName.toUtf8());
+        QByteArray sig;
+        if (CryptoUtil::signDetached(ks->localPrivKey(), idInput, &sig))
+            out.insert("sig", b64(sig));
+        else
+            qWarning() << "[认证] 身份私钥签名失败：" << CryptoUtil::lastError();
+    }
+
+    // 口令用完就丢，不在内存里常驻
+    m_loginPasswd.clear();
+
+    sendMessage(Login, QJsonValue(out));
+    return true;
 }
 
 void MySocket::sendMsgType(const quint8 &nType, const QJsonValue &dataVal)
 {
+    // Login(0x11) 与 GroupOperateFailed(0x11) 数值撞车（历史上两套枚举混用），
+    // 所以挑战必须在 switch 之前单独认：只有带 step=challenge 的才截获。
+    if (nType == Login && dataVal.isObject()
+            && dataVal.toObject().value("step").toString() == QLatin1String("challenge")) {
+        handleAuthChallenge(dataVal);
+        return;
+    }
+
     switch (nType) {
     case LoginSuccess:
     {
+        m_loginPasswd.clear();     // 登录成功后不再需要口令
         emit signalStatus(LoginSuccess,dataVal);
         break;
     }
@@ -271,6 +516,7 @@ void MySocket::sendMsgType(const quint8 &nType, const QJsonValue &dataVal)
     }
     case LoginPasswdError:
     {
+        m_loginPasswd.clear();
         emit signalStatus(LoginPasswdError,dataVal);
         break;
     }

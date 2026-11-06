@@ -59,6 +59,8 @@ public slots:
     // 服务端回执：把对应气泡从"发送中"改成"已送达"
     bool hasMsgKey(const QString &msgKey) const;   // 本窗口里有没有这条消息
     void onSendAck(const QString &msgKey);
+    /// 服务端明确拒绝转发（如非好友），把这条气泡标红
+    void failSendByKey(const QString &msgKey);
     // 链路断开时把还在等回执的消息全部标成发送失败
     void failPendingSends(const QString &reason);
 

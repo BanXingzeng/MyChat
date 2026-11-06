@@ -309,8 +309,90 @@ QJsonObject DataBaseMag::userLogin(const QString &name, const QString &passwd)
     return jsonObj;
 }
 
-bool DataBaseMag::isFriend(const int &userId, const QString &friendName)
+/**
+ * @brief DataBaseMag::authParams
+ * 挑战-应答登录用：把库里的 pbkdf2-sha256$iter$salt$digest 拆开交给上层。
+ *
+ * 注意 digest 这一项就是协议里的 verifier，服务端用它对客户端发来的
+ * proof 做一次 HMAC 重算即可，**不需要、也拿不到口令原文**。
+ * 若历史数据还是明文（迁移未跑或迁移失败），这里返回 false ——
+ * 明文没法参与挑战-应答，只能等迁移完成后才能登录。
+ */
+bool DataBaseMag::authParams(const QString &name, int *uid, QByteArray *salt,
+                             int *iterations, QByteArray *verifier)
 {
+    if (uid) *uid = -1;
+
+    QSqlQuery query;
+    query.prepare("SELECT id, passwd FROM USERINFO WHERE name = ?");
+    query.addBindValue(name);
+    if (!query.exec() || !query.next()) return false;
+
+    const QString stored = query.value("passwd").toString();
+    if (!PasswordHash::isHashed(stored)) {
+        qWarning() << "[认证] 用户" << name << "的口令还未迁移成哈希，无法走挑战-应答";
+        return false;
+    }
+
+    const QStringList parts = stored.split(QLatin1Char('$'));
+    if (parts.size() != 4) return false;
+
+    bool ok = false;
+    const int iter = parts.at(1).toInt(&ok);
+    if (!ok || iter <= 0) return false;
+
+    const QByteArray s = QByteArray::fromBase64(parts.at(2).toLatin1());
+    const QByteArray v = QByteArray::fromBase64(parts.at(3).toLatin1());
+    if (s.isEmpty() || v.isEmpty()) return false;
+
+    if (uid) *uid = query.value("id").toInt();
+    if (salt) *salt = s;
+    if (iterations) *iterations = iter;
+    if (verifier) *verifier = v;
+    return true;
+}
+
+/**
+ * @brief DataBaseMag::loginResultById
+ * 口令已由挑战-应答证明过，这里只按 uid 走原来的"在线/顶号"判定。
+ * 返回结构与 userLogin 保持一致，上层不必区分两条路径。
+ */
+QJsonObject DataBaseMag::loginResultById(int uid)
+{
+    QJsonObject jsonObj;
+    int nId = -1;
+    int code = -1;
+    QString strHead = "0.bmp";
+
+    QSqlQuery query;
+    query.prepare("SELECT head, status FROM USERINFO WHERE id = ?");
+    query.addBindValue(uid);
+    if (query.exec() && query.next()) {
+        strHead = query.value("head").toString();
+        const int nStatus = query.value("status").toInt();
+        if (OnLine == nStatus) {
+            // 数据库记着在线，真实情况由连接表判定，把 realId 带出去
+            jsonObj.insert("realId", uid);
+            nId = -2;
+            code = -2;
+        } else {
+            UpdateUserStatus(uid, OnLine);
+            nId = uid;
+            code = 0;
+        }
+    }
+
+    jsonObj.insert("id", nId);
+    if (nId == -1)      jsonObj.insert("msg", "noneUser");
+    else if (nId == -2) jsonObj.insert("msg", "OnLine");
+    else                jsonObj.insert("msg", "ok");
+    jsonObj.insert("head", strHead);
+    jsonObj.insert("code", code);
+
+    return jsonObj;
+}
+
+bool DataBaseMag::isFriend(const int &userId, const QString &friendName){
     QSqlQuery query;
     const QString sql = "SELECT 1 FROM FRIEND "
                         "WHERE user_id = :user_id "
@@ -326,6 +408,40 @@ bool DataBaseMag::isFriend(const int &userId, const QString &friendName)
     }
     return query.next();
 
+}
+
+bool DataBaseMag::isFriendById(int userId, int friendId)
+{
+    if (userId <= 0 || friendId <= 0 || userId == friendId) return false;
+
+    QSqlQuery query;
+    query.prepare("SELECT 1 FROM FRIEND "
+                  "WHERE user_id = :user_id AND friend_id = :friend_id LIMIT 1");
+    query.bindValue(":user_id", userId);
+    query.bindValue(":friend_id", friendId);
+
+    if (!query.exec()) {
+        qDebug() << "[授权] 查询好友关系失败" << query.lastError();
+        return false;
+    }
+    return query.next();
+}
+
+bool DataBaseMag::isGroupMember(int groupId, int userId)
+{
+    if (groupId <= 0 || userId <= 0) return false;
+
+    QSqlQuery query;
+    query.prepare("SELECT 1 FROM GROUP_MEMBER "
+                  "WHERE group_id = :group_id AND user_id = :user_id LIMIT 1");
+    query.bindValue(":group_id", groupId);
+    query.bindValue(":user_id", userId);
+
+    if (!query.exec()) {
+        qDebug() << "[授权] 查询群成员失败" << query.lastError();
+        return false;
+    }
+    return query.next();
 }
 
 /**
